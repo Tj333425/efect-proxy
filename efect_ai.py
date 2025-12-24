@@ -1,59 +1,38 @@
-# efect_ai.py
-# EFECT AI Desktop Client (Tkinter)
-# - Online proxy support (HTTPS)
-# - Attach button + Screenshot button
-# - Drag & drop files into the chat (optional via tkinterdnd2)
-# - Images: sent as input_image (base64 data URL)
-# - PDFs/other files: uploaded to proxy -> returns file_id -> sent as input_file
-#
-# Install deps:
-#   py -m pip install requests pillow
-# Optional drag-drop:
-#   py -m pip install tkinterdnd2
-#
-# Build EXE:
-#   py -m pip install pyinstaller
-#   py -m PyInstaller --onefile --windowed --name "EFECT AI" efect_ai.py
-
 import os
 import json
-import time
-import base64
 import threading
-import webbrowser
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from io import BytesIO
-from typing import Optional, Tuple
+from tkinter import messagebox, filedialog
+from typing import List, Dict, Any
 
 import requests
-from PIL import ImageGrab
-
-# Drag & drop (optional)
-DND_OK = False
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES  # type: ignore
-    DND_OK = True
-except Exception:
-    TkinterDnD = None
-    DND_FILES = None
 
 APP_NAME = "EFECT_AI"
+
 DEFAULT_MODEL = "gpt-4.1-mini"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are EFECT AI, a helpful assistant for the EFECT brand.\n"
+    "Be practical, step-by-step, and creative for open-ended requests.\n"
+    "If the user asks for something unsafe or disallowed, refuse clearly.\n"
+)
 
 DEFAULT_SETTINGS = {
     "proxy_base_url": "https://efect-proxy.onrender.com",
     "model": DEFAULT_MODEL,
-    "token": "efect-12345",
-    "auto_open_website": False,
+    "token": "",
 }
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are EFECT AI, an assistant for the EFECT brand.\n"
-    "Be practical and step-by-step.\n"
-    "No cheats/spoofers/bypasses.\n"
-    "If user attaches screenshots/files, analyze them.\n"
-)
+THEME = {
+    "bg": "#0B0B0B",
+    "panel": "#101010",
+    "fg": "#E8E8E8",
+    "muted": "#9AA0AA",
+    "green": "#1BFF4A",
+    "border": "#2A2A2A",
+    "danger": "#FF4A4A",
+}
+
 
 def appdata_dir() -> str:
     base = os.getenv("APPDATA") or os.path.expanduser("~")
@@ -61,391 +40,222 @@ def appdata_dir() -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
+
 def settings_path() -> str:
     return os.path.join(appdata_dir(), "settings.json")
 
-def safe_load_json(path: str, default: dict) -> dict:
-    try:
-        if not os.path.exists(path):
-            return dict(default)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return dict(default)
-        merged = dict(default)
-        merged.update(data)
-        return merged
-    except Exception:
-        return dict(default)
 
-def safe_save_json(path: str, data: dict) -> None:
+def safe_load_settings() -> Dict[str, Any]:
+    p = settings_path()
+    if not os.path.exists(p):
+        return dict(DEFAULT_SETTINGS)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out = dict(DEFAULT_SETTINGS)
+        out.update({k: v for k, v in data.items() if k in out})
+        return out
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(data: Dict[str, Any]) -> None:
+    try:
+        with open(settings_path(), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
         pass
 
-def is_image(path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
-    return ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
 
-def file_to_data_url(path: str) -> Tuple[str, str]:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".png":
-        mime = "image/png"
-    elif ext in [".jpg", ".jpeg"]:
-        mime = "image/jpeg"
-    elif ext == ".webp":
-        mime = "image/webp"
-    elif ext == ".bmp":
-        mime = "image/bmp"
-    else:
-        mime = "application/octet-stream"
+def build_responses_payload(system_prompt: str, history: List[Dict[str, str]], user_text: str, model: str) -> Dict[str, Any]:
+    """
+    CRITICAL FIX:
+      - user/system => input_text
+      - assistant => output_text
+    """
+    inp = []
 
-    with open(path, "rb") as f:
-        b = f.read()
+    if system_prompt.strip():
+        inp.append({
+            "role": "system",
+            "content": [{"type": "input_text", "text": system_prompt}]
+        })
 
-    b64 = base64.b64encode(b).decode("utf-8")
-    return mime, f"data:{mime};base64,{b64}"
+    for m in history:
+        role = (m.get("role") or "").strip().lower()
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+
+        if role == "user":
+            inp.append({"role": "user", "content": [{"type": "input_text", "text": text}]})
+        elif role == "assistant":
+            inp.append({"role": "assistant", "content": [{"type": "output_text", "text": text}]})
+
+    if user_text.strip():
+        inp.append({"role": "user", "content": [{"type": "input_text", "text": user_text}]})
+
+    return {
+        "model": model,
+        "input": inp,
+        "stream": False,  # prevents duplicate UI issues
+    }
+
 
 class EfectAIApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.settings = safe_load_json(settings_path(), DEFAULT_SETTINGS)
-        self.stop_flag = threading.Event()
-        self.attachments = []  # list of dicts: {kind, name, path, data_url, file_id}
-
-        # Theme
-        self.bg = "#0B0B0B"
-        self.panel = "#0F1016"
-        self.fg = "#E8E8F0"
-        self.muted = "#9AA0AA"
-        self.green = "#7CFF7A"
-        self.border = "#2A2D3A"
-
         self.root.title("EFECT AI")
+        self.root.configure(bg=THEME["bg"])
         self.root.geometry("1100x740")
         self.root.minsize(900, 620)
-        self.root.configure(bg=self.bg)
 
-        self.token_var = tk.StringVar(value=self.settings.get("token", ""))
-        self.model_var = tk.StringVar(value=self.settings.get("model", DEFAULT_MODEL))
-        self.proxy_var = tk.StringVar(value=self.settings.get("proxy_base_url", "https://efect-proxy.onrender.com"))
-        self.auto_open_var = tk.BooleanVar(value=bool(self.settings.get("auto_open_website", False)))
+        self.settings = safe_load_settings()
+
+        self.proxy_var = tk.StringVar(value=self.settings["proxy_base_url"])
+        self.model_var = tk.StringVar(value=self.settings["model"])
+        self.token_var = tk.StringVar(value=self.settings["token"])
+
+        # Chat history used for context
+        self.chat_history: List[Dict[str, str]] = []
 
         self._build_ui()
 
-        # Optional: auto-open website
-        if self.auto_open_var.get():
-            try:
-                webbrowser.open(self.proxy_var.get().rstrip("/"))
-            except Exception:
-                pass
-
-    def _save_settings(self):
-        self.settings["token"] = self.token_var.get().strip()
-        self.settings["model"] = self.model_var.get().strip() or DEFAULT_MODEL
-        self.settings["proxy_base_url"] = self.proxy_var.get().strip()
-        self.settings["auto_open_website"] = bool(self.auto_open_var.get())
-        safe_save_json(settings_path(), self.settings)
-
     def _build_ui(self):
-        header = tk.Frame(self.root, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
+        header = tk.Frame(self.root, bg=THEME["panel"], highlightbackground=THEME["border"], highlightthickness=1)
         header.pack(side=tk.TOP, fill=tk.X, padx=16, pady=(16, 10))
 
-        left = tk.Frame(header, bg=self.panel)
+        left = tk.Frame(header, bg=THEME["panel"])
         left.pack(side=tk.LEFT, padx=14, pady=10)
-        tk.Label(left, text="EFECT", fg=self.green, bg=self.panel, font=("Segoe UI", 22, "bold")).pack(side=tk.LEFT)
-        tk.Label(left, text=" AI", fg=self.fg, bg=self.panel, font=("Segoe UI", 22, "bold")).pack(side=tk.LEFT)
-        tk.Label(left, text="  •  Online", fg=self.muted, bg=self.panel, font=("Segoe UI", 12)).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(left, text="EFECT", fg=THEME["green"], bg=THEME["panel"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(left, text="AI", fg=THEME["fg"], bg=THEME["panel"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
 
-        right = tk.Frame(header, bg=self.panel)
+        right = tk.Frame(header, bg=THEME["panel"])
         right.pack(side=tk.RIGHT, padx=14, pady=10)
 
-        tk.Label(right, text="Model:", fg=self.muted, bg=self.panel, font=("Segoe UI", 11)).grid(row=0, column=0, sticky="e", padx=(0, 8))
-        tk.Entry(right, textvariable=self.model_var, width=18, bg=self.bg, fg=self.fg, insertbackground=self.green,
-                 highlightbackground=self.border, highlightthickness=1).grid(row=0, column=1, padx=(0, 14))
+        tk.Label(right, text="Proxy:", fg=THEME["muted"], bg=THEME["panel"], font=("Segoe UI", 10)).grid(row=0, column=0, sticky="e", padx=(0, 6))
+        tk.Entry(right, textvariable=self.proxy_var, width=40, bg=THEME["bg"], fg=THEME["fg"],
+                 insertbackground=THEME["green"], highlightbackground=THEME["border"], highlightthickness=1).grid(row=0, column=1, padx=(0, 10))
 
-        tk.Label(right, text="Token:", fg=self.muted, bg=self.panel, font=("Segoe UI", 11)).grid(row=0, column=2, sticky="e", padx=(0, 8))
-        tk.Entry(right, textvariable=self.token_var, width=22, bg=self.bg, fg=self.fg, insertbackground=self.green,
-                 highlightbackground=self.border, highlightthickness=1, show="•").grid(row=0, column=3, padx=(0, 14))
+        tk.Label(right, text="Model:", fg=THEME["muted"], bg=THEME["panel"], font=("Segoe UI", 10)).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        tk.Entry(right, textvariable=self.model_var, width=18, bg=THEME["bg"], fg=THEME["fg"],
+                 insertbackground=THEME["green"], highlightbackground=THEME["border"], highlightthickness=1).grid(row=0, column=3, padx=(0, 10))
 
-        tk.Button(right, text="Open Website", command=self.open_website,
-                  bg=self.bg, fg=self.fg, activebackground=self.panel, activeforeground=self.fg,
-                  highlightbackground=self.border, highlightthickness=1, padx=14, pady=6).grid(row=0, column=4, padx=(0, 10))
+        tk.Label(right, text="Token:", fg=THEME["muted"], bg=THEME["panel"], font=("Segoe UI", 10)).grid(row=1, column=0, sticky="e", padx=(0, 6), pady=(8, 0))
+        tk.Entry(right, textvariable=self.token_var, width=40, show="•", bg=THEME["bg"], fg=THEME["fg"],
+                 insertbackground=THEME["green"], highlightbackground=THEME["border"], highlightthickness=1).grid(row=1, column=1, padx=(0, 10), pady=(8, 0))
 
-        tk.Checkbutton(
-            right, text="Auto-open", variable=self.auto_open_var,
-            bg=self.panel, fg=self.muted, activebackground=self.panel, activeforeground=self.muted,
-            selectcolor=self.bg, command=self._save_settings
-        ).grid(row=0, column=5, padx=(0, 0))
+        tk.Button(right, text="Save", command=self._save_settings, bg=THEME["panel"], fg=THEME["fg"],
+                  activebackground=THEME["panel"], activeforeground=THEME["fg"], highlightbackground=THEME["border"]).grid(row=1, column=2, columnspan=2, sticky="we", pady=(8, 0))
 
-        # Proxy URL row
-        proxy_row = tk.Frame(self.root, bg=self.bg)
-        proxy_row.pack(side=tk.TOP, fill=tk.X, padx=16, pady=(0, 10))
+        # Main layout
+        main = tk.Frame(self.root, bg=THEME["bg"])
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
 
-        tk.Label(proxy_row, text="Proxy URL:", fg=self.muted, bg=self.bg, font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Entry(proxy_row, textvariable=self.proxy_var, bg=self.panel, fg=self.fg, insertbackground=self.green,
-                 highlightbackground=self.border, highlightthickness=1).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        tk.Button(proxy_row, text="Save", command=self._save_settings,
-                  bg=self.green, fg="#000", activebackground=self.green, activeforeground="#000",
-                  padx=16, pady=6).pack(side=tk.LEFT)
+        self.chat = tk.Text(main, bg=THEME["bg"], fg=THEME["fg"], insertbackground=THEME["green"],
+                            wrap="word", bd=0, highlightthickness=1, highlightbackground=THEME["border"])
+        self.chat.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.chat.config(state="disabled")
 
-        # Chat area
-        chat_frame = tk.Frame(self.root, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
-        chat_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+        footer = tk.Frame(main, bg=THEME["bg"])
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
 
-        self.chat = tk.Text(chat_frame, bg=self.panel, fg=self.fg, insertbackground=self.green, wrap=tk.WORD,
-                            font=("Segoe UI", 11), bd=0)
-        self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=12, pady=12)
+        self.input = tk.Text(footer, height=3, bg=THEME["panel"], fg=THEME["fg"], insertbackground=THEME["green"],
+                             wrap="word", bd=0, highlightthickness=1, highlightbackground=THEME["border"])
+        self.input.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        scrollbar = tk.Scrollbar(chat_frame, command=self.chat.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.chat.config(yscrollcommand=scrollbar.set)
+        send_btn = tk.Button(footer, text="Send", command=self.send, bg=THEME["green"], fg="#000000",
+                             activebackground=THEME["green"], activeforeground="#000000", bd=0, padx=18, pady=10)
+        send_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
-        self._append_line("EFECT AI: Hello! Ask me anything. Use Attach or Screenshot for files/images.\n")
+        self._append_line("EFECT AI ready. Type a message and press Send.\n", tag="muted")
 
-        # Bottom input
-        bottom = tk.Frame(self.root, bg=self.bg)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 16))
+    def _save_settings(self):
+        self.settings["proxy_base_url"] = self.proxy_var.get().strip()
+        self.settings["model"] = self.model_var.get().strip() or DEFAULT_MODEL
+        self.settings["token"] = self.token_var.get().strip()
+        save_settings(self.settings)
+        messagebox.showinfo("Saved", "Settings saved.")
 
-        self.input = tk.Text(bottom, height=3, bg=self.panel, fg=self.fg, insertbackground=self.green,
-                             highlightbackground=self.border, highlightthickness=1, font=("Segoe UI", 11))
-        self.input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-
-        controls = tk.Frame(bottom, bg=self.bg)
-        controls.pack(side=tk.RIGHT)
-
-        tk.Button(controls, text="Attach", command=self.attach_file,
-                  bg=self.bg, fg=self.fg, highlightbackground=self.border, highlightthickness=1,
-                  padx=14, pady=8).pack(side=tk.LEFT, padx=(0, 10))
-
-        tk.Button(controls, text="Screenshot", command=self.screenshot,
-                  bg=self.bg, fg=self.fg, highlightbackground=self.border, highlightthickness=1,
-                  padx=14, pady=8).pack(side=tk.LEFT, padx=(0, 10))
-
-        tk.Button(controls, text="Send", command=self.send,
-                  bg=self.green, fg="#000", padx=18, pady=10).pack(side=tk.LEFT)
-
-        # Optional drag & drop
-        if DND_OK and isinstance(self.root, TkinterDnD.Tk):
-            try:
-                self.chat.drop_target_register(DND_FILES)
-                self.chat.dnd_bind("<<Drop>>", self._on_drop)
-            except Exception:
-                pass
-
-    def _append_line(self, text: str):
-        self.chat.insert(tk.END, text)
-        self.chat.see(tk.END)
-
-    def open_website(self):
-        url = self.proxy_var.get().strip().rstrip("/")
-        if not url:
-            messagebox.showerror("EFECT AI", "Proxy URL is empty.")
-            return
-        try:
-            webbrowser.open(url)
-        except Exception as e:
-            messagebox.showerror("EFECT AI", str(e))
-
-    def _proxy_base(self) -> str:
-        return self.proxy_var.get().strip().rstrip("/")
-
-    def _token(self) -> str:
-        return self.token_var.get().strip()
-
-    def attach_file(self):
-        path = filedialog.askopenfilename()
-        if not path:
-            return
-        self._add_attachment(path)
-
-    def _add_attachment(self, path: str):
-        name = os.path.basename(path)
-        if is_image(path):
-            mime, data_url = file_to_data_url(path)
-            self.attachments.append({"kind": "image", "name": name, "path": path, "mime": mime, "data_url": data_url})
-            self._append_line(f"[EFECT] Attached image: {name}\n")
+    def _append_line(self, text: str, tag: str = "normal"):
+        self.chat.config(state="normal")
+        if tag == "muted":
+            self.chat.insert("end", text)
         else:
-            self.attachments.append({"kind": "file", "name": name, "path": path})
-            self._append_line(f"[EFECT] Attached file: {name}\n")
+            self.chat.insert("end", text)
+        self.chat.see("end")
+        self.chat.config(state="disabled")
 
-    def _on_drop(self, event):
-        # event.data can contain one or multiple paths
-        data = event.data
-        # Clean braces on windows paths
-        paths = []
-        cur = ""
-        in_brace = False
-        for ch in data:
-            if ch == "{":
-                in_brace = True
-                cur = ""
-            elif ch == "}":
-                in_brace = False
-                if cur.strip():
-                    paths.append(cur.strip())
-                cur = ""
-            elif ch == " " and not in_brace:
-                if cur.strip():
-                    paths.append(cur.strip())
-                cur = ""
-            else:
-                cur += ch
-        if cur.strip():
-            paths.append(cur.strip())
+    def _append_msg(self, who: str, text: str):
+        self.chat.config(state="normal")
+        self.chat.insert("end", f"{who}\n", ())
+        self.chat.insert("end", f"{text}\n\n", ())
+        self.chat.see("end")
+        self.chat.config(state="disabled")
 
-        for p in paths:
-            p = p.strip()
-            if os.path.exists(p):
-                self._add_attachment(p)
+    def _get_input_text(self) -> str:
+        return self.input.get("1.0", "end").strip()
 
-    def screenshot(self):
-        try:
-            img = ImageGrab.grab()
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            data_url = f"data:image/png;base64,{b64}"
-            name = f"screenshot_{int(time.time())}.png"
-            self.attachments.append({"kind": "image", "name": name, "mime": "image/png", "data_url": data_url})
-            self._append_line(f"[EFECT] Captured screenshot: {name}\n")
-        except Exception as e:
-            messagebox.showerror("EFECT AI", f"Screenshot failed: {e}")
-
-    def _upload_file_to_proxy(self, path: str) -> Optional[str]:
-        base = self._proxy_base()
-        if not base.startswith("http"):
-            self._append_line("[EFECT] Set Proxy URL first (https://...)\n")
-            return None
-
-        token = self._token()
-        if not token:
-            self._append_line("[EFECT] Missing EFECT token.\n")
-            return None
-
-        url = base + "/upload"
-        headers = {"Authorization": f"Bearer {token}"}
-
-        try:
-            with open(path, "rb") as f:
-                files = {"file": (os.path.basename(path), f, "application/octet-stream")}
-                r = requests.post(url, headers=headers, files=files, timeout=300)
-            if r.status_code >= 400:
-                self._append_line(f"[EFECT] Upload error: {r.status_code} {r.text}\n")
-                return None
-            j = r.json()
-            return j.get("id")
-        except Exception as e:
-            self._append_line(f"[EFECT] Upload exception: {e}\n")
-            return None
+    def _clear_input(self):
+        self.input.delete("1.0", "end")
 
     def send(self):
-        msg = self.input.get("1.0", tk.END).strip()
-        if not msg and not self.attachments:
+        msg = self._get_input_text()
+        if not msg:
             return
 
-        self._save_settings()
+        proxy = self.proxy_var.get().strip().rstrip("/")
+        token = self.token_var.get().strip()
+        model = self.model_var.get().strip() or DEFAULT_MODEL
 
-        # display user message
-        if msg:
-            self._append_line(f"You: {msg}\n")
+        if not proxy.startswith("http"):
+            messagebox.showerror("Proxy URL", "Set Proxy to a valid URL (https://...)")
+            return
+        if not token:
+            messagebox.showerror("Token", "Enter your EFECT proxy token.")
+            return
 
-        # disable send while working
-        self.input.delete("1.0", tk.END)
+        self._append_msg("You", msg)
+        self.chat_history.append({"role": "user", "text": msg})
+        self._clear_input()
 
-        t = threading.Thread(target=self._send_worker, args=(msg, list(self.attachments)), daemon=True)
-        self.attachments.clear()
-        t.start()
-
-    def _send_worker(self, msg: str, attachments: list):
-        try:
-            base = self._proxy_base()
-            token = self._token()
-            model = self.model_var.get().strip() or DEFAULT_MODEL
-
-            if not base.startswith("http"):
-                self._append_line("[EFECT] Error: Proxy URL must start with http(s)\n")
-                return
-            if not token:
-                self._append_line("[EFECT] Error: Missing EFECT token.\n")
-                return
-
-            # Build Responses input (text + images + files)
-            content = []
-            if msg:
-                content.append({"type": "input_text", "text": msg})
-
-            # Images: inline data URLs
-            for a in attachments:
-                if a.get("kind") == "image":
-                    content.append({"type": "input_image", "image_url": a["data_url"]})
-
-            # Files: upload to proxy -> use file_id
-            for a in attachments:
-                if a.get("kind") == "file":
-                    file_id = self._upload_file_to_proxy(a["path"])
-                    if file_id:
-                        content.append({"type": "input_file", "file_id": file_id})
-                    else:
-                        self._append_line(f"[EFECT] Skipped file (upload failed): {a.get('name')}\n")
-
-            payload = {
-                "model": model,
-                "input": [
-                    {"role": "system", "content": [{"type": "input_text", "text": DEFAULT_SYSTEM_PROMPT}]},
-                    {"role": "user", "content": content if content else [{"type": "input_text", "text": msg or ""}]},
-                ],
-                "stream": False,
-            }
-
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            }
-
-            r = requests.post(base + "/responses", headers=headers, json=payload, timeout=300)
-            if r.status_code >= 400:
-                self._append_line(f"EFECT AI:\n[EFECT] Error: {r.text}\n")
-                return
-
-            data = r.json()
-
-            # Extract assistant text from Responses API output
-            out_text = None
+        def worker():
             try:
-                # common shape: data["output"][0]["content"][0]["text"]
-                output = data.get("output", [])
-                for item in output:
-                    if item.get("type") == "message":
-                        for c in item.get("content", []):
-                            if c.get("type") in ("output_text", "text"):
-                                out_text = c.get("text")
-                                break
-                    if out_text:
-                        break
-            except Exception:
-                out_text = None
+                payload = build_responses_payload(
+                    system_prompt=DEFAULT_SYSTEM_PROMPT,
+                    history=self.chat_history[-20:],  # keep recent context
+                    user_text=msg,
+                    model=model,
+                )
+                r = requests.post(
+                    proxy + "/responses",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=payload,
+                    timeout=300
+                )
+                data = r.json()
 
-            if not out_text:
-                out_text = json.dumps(data, indent=2)[:4000]
+                if r.status_code >= 400:
+                    # Show error
+                    err_txt = json.dumps(data, indent=2)
+                    self.root.after(0, lambda: self._append_msg("EFECT AI", err_txt))
+                    return
 
-            self._append_line(f"EFECT AI: {out_text}\n\n")
+                out = (data.get("output_text") or "").strip()
+                if not out:
+                    out = "(No output_text returned. Check proxy response.)"
 
-        except Exception as e:
-            self._append_line(f"EFECT AI:\n[EFECT] Error: {e}\n")
+                # Save assistant message into history (as plain text)
+                self.chat_history.append({"role": "assistant", "text": out})
+                self.root.after(0, lambda: self._append_msg("EFECT AI", out))
 
+            except Exception as e:
+                self.root.after(0, lambda: self._append_msg("EFECT AI", f"Error: {e}"))
 
-def main():
-    if DND_OK:
-        root = TkinterDnD.Tk()
-    else:
-        root = tk.Tk()
-
-    app = EfectAIApp(root)
-    root.mainloop()
+        threading.Thread(target=worker, daemon=True).start()
 
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = EfectAIApp(root)
+    root.mainloop()
