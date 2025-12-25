@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Request, Form
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -45,9 +45,9 @@ MAX_ATTACH_TEXT_BYTES = MAX_ATTACH_TEXT_KB * 1024
 
 PREVIEW_TOKEN_TTL_SECONDS = int(os.getenv("EFECT_PREVIEW_TTL_SECONDS", "86400"))  # 24h default
 
-# Workspace limits (avoid huge payloads)
+# Workspace limits (keep stable)
 WORKSPACE_MAX_FILES = int(os.getenv("EFECT_WORKSPACE_MAX_FILES", "80"))
-WORKSPACE_MAX_TOTAL_KB = int(os.getenv("EFECT_WORKSPACE_MAX_TOTAL_KB", "1500"))  # 1.5 MB total text
+WORKSPACE_MAX_TOTAL_KB = int(os.getenv("EFECT_WORKSPACE_MAX_TOTAL_KB", "1500"))
 WORKSPACE_MAX_TOTAL_BYTES = WORKSPACE_MAX_TOTAL_KB * 1024
 
 
@@ -64,7 +64,7 @@ app.add_middleware(
 
 
 # =========================================================
-# DB HELPERS
+# DB
 # =========================================================
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
@@ -83,7 +83,6 @@ def init_db() -> None:
         updated_at INTEGER NOT NULL
     )
     """)
-
     # Migration: title column
     try:
         cur.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
@@ -179,7 +178,7 @@ def verify_preview_token(file_id: str, stored_name: str, exp: int, token: str) -
 
 
 # =========================================================
-# OPENAI (Responses API) - NON-STREAM
+# OPENAI (Responses API)
 # =========================================================
 def openai_responses(messages: List[Dict[str, str]], model: str) -> str:
     if not OPENAI_API_KEY:
@@ -206,9 +205,6 @@ def openai_responses(messages: List[Dict[str, str]], model: str) -> str:
     return out_text.strip() or "(No text returned)"
 
 
-# =========================================================
-# OPENAI (Responses API) - STREAM
-# =========================================================
 def openai_responses_stream(messages: List[Dict[str, str]], model: str):
     if not OPENAI_API_KEY:
         yield "OPENAI_API_KEY is not set on the server.\n"
@@ -247,7 +243,6 @@ def openai_responses_stream(messages: List[Dict[str, str]], model: str):
                     yield delta
                 continue
 
-            # best-effort fallback
             if evt_type and "delta" in evt and isinstance(evt.get("delta"), str):
                 yield evt["delta"]
                 continue
@@ -262,7 +257,7 @@ def openai_responses_stream(messages: List[Dict[str, str]], model: str):
 
 
 # =========================================================
-# PROMPTING (wide intelligence + routing)
+# PROMPTING
 # =========================================================
 def default_system_prompt() -> str:
     return (
@@ -312,7 +307,7 @@ def summarize_session(session_id: str, model: str) -> str:
 
 
 # =========================================================
-# KNOWLEDGE SEARCH (lightweight)
+# KNOWLEDGE SEARCH
 # =========================================================
 def tokenize(text: str) -> List[str]:
     t = text.lower()
@@ -376,7 +371,6 @@ def read_text_file(path: Path, max_bytes: int) -> str:
 
 
 def clamp_workspace(files: Dict[str, str]) -> Dict[str, str]:
-    # Enforce limits for safety and reliability
     items = list(files.items())[:WORKSPACE_MAX_FILES]
     out: Dict[str, str] = {}
     total = 0
@@ -407,22 +401,6 @@ class ChatV2Request(BaseModel):
     file_ids: Optional[List[str]] = None
 
 
-class KnowledgeUpsertRequest(BaseModel):
-    title: str
-    content: str
-    id: Optional[str] = None
-
-
-class KnowledgeSearchRequest(BaseModel):
-    query: str
-    top_k: int = 5
-
-
-class ProfileSetRequest(BaseModel):
-    key: str
-    value: str
-
-
 class SessionRenameRequest(BaseModel):
     session_id: str
     title: str
@@ -448,7 +426,59 @@ def root():
 
 
 # ---------------------------
-# Chat + Workspace UI at /chat
+# IMAGE EDIT (ChatGPT-style)
+# ---------------------------
+@app.post("/api/image_edit")
+async def image_edit(
+    prompt: str = Form(...),
+    image: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Upload an image + instruction prompt, returns edited image bytes (PNG).
+    No persistent storage required.
+    """
+    require_token(authorization)
+
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+
+    img_bytes = await image.read()
+    if len(img_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image too large (50MB max)")
+
+    url = "https://api.openai.com/v1/images/edits"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    files = {
+        "image": (image.filename or "image.png", img_bytes, image.content_type or "image/png"),
+    }
+    data = {
+        "model": "gpt-image-1",
+        "prompt": prompt,
+        "size": "1024x1024",
+    }
+
+    try:
+        r = requests.post(url, headers=headers, files=files, data=data, timeout=180)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI request failed: {e}")
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"OpenAI error {r.status_code}: {r.text}")
+
+    out = r.json()
+    try:
+        b64 = out["data"][0]["b64_json"]
+        edited_bytes = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Unexpected image response: {out}")
+
+    return Response(content=edited_bytes, media_type="image/png")
+
+
+# ---------------------------
+# Chat UI at /chat
 # ---------------------------
 @app.get("/chat", response_class=HTMLResponse)
 def chat_ui():
@@ -500,11 +530,14 @@ def chat_ui():
     .tab{border:1px solid var(--border);background:var(--panel2);color:var(--text);
       padding:8px 12px;border-radius:12px;cursor:pointer;font-size:13px}
     .tab.active{background:#0f1a12;border-color:#1d3a2a}
+
     .content{flex:1;overflow:auto;padding:18px;display:flex;justify-content:center}
     .chatWrap{width:min(1050px,100%);display:flex;flex-direction:column;gap:12px}
+
     .msg{padding:12px 14px;border-radius:16px;line-height:1.35;white-space:pre-wrap;box-shadow:var(--shadow);border:1px solid var(--border)}
     .msg.user{background:var(--bubbleU)}
     .msg.ai{background:var(--bubbleA);border-color:#1d3a2a}
+
     .msgHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
     .name{font-weight:800;font-size:13px}
     .tools{display:flex;gap:8px}
@@ -519,68 +552,78 @@ def chat_ui():
       background:var(--panel2);color:var(--text);border:1px solid var(--border);
       border-radius:16px;padding:12px 12px;font-size:14px;outline:none
     }
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     select,input[type="text"]{
       background:var(--panel2);color:var(--text);border:1px solid var(--border);
       border-radius:12px;padding:10px 12px
     }
     input[type="file"]{display:none}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .right{margin-left:auto}
     .typing{font-size:13px;color:var(--muted);padding:6px 2px}
 
-    /* Upload previews (server uploads) */
-    .previewRow{display:flex;flex-wrap:wrap;gap:10px}
-    .thumb{
-      width:120px;height:120px;object-fit:cover;
-      border-radius:14px;border:1px solid var(--border);
-      box-shadow:var(--shadow);cursor:pointer;
-    }
-    .thumbWrap{display:flex;flex-direction:column;gap:6px;max-width:120px}
-    .thumbCap{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-    /* Workspace layout */
-    .ws{
-      width:min(1050px,100%);
-      display:grid;
-      grid-template-columns: 320px 1fr;
-      gap:12px;
-      align-items:stretch;
-    }
-    .card{
+    /* Attachment cards (ChatGPT-like) */
+    .attachTray{display:flex;flex-wrap:wrap;gap:10px}
+    .attachCard{
+      display:flex;gap:10px;align-items:center;
       border:1px solid var(--border);
-      background:rgba(15,15,15,.7);
-      border-radius:16px;
+      background:rgba(15,15,15,.85);
+      border-radius:14px;
+      padding:10px;
+      max-width:520px;
       box-shadow:var(--shadow);
-      overflow:hidden;
     }
-    .cardHead{
-      padding:12px 12px;
-      border-bottom:1px solid #1b1b1b;
-      display:flex;gap:10px;align-items:center;justify-content:space-between;
+    .attachThumb{
+      width:76px;height:76px;border-radius:12px;object-fit:cover;
+      border:1px solid var(--border);cursor:pointer;
+      background:#0a0a0a;
     }
-    .cardBody{padding:12px}
-    .fileList{max-height:520px;overflow:auto}
-    .fileItem{
-      padding:10px 10px;
-      border-bottom:1px solid #1b1b1b;
-      cursor:pointer;
-      font-size:13px;
-      color:var(--text);
-      display:flex;justify-content:space-between;gap:10px;align-items:center;
-    }
-    .fileItem:hover{background:#101010}
-    .fileItem.active{background:#0f1a12;border-left:3px solid var(--accent)}
-    .fileMeta{font-size:11px;color:var(--muted)}
+    .attachInfo{display:flex;flex-direction:column;gap:4px;min-width:200px}
+    .attachName{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .attachMeta{font-size:12px;color:var(--muted)}
+    .attachActions{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
     .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
-    .wsEditor{min-height:520px;max-height:520px}
-    .warn{color:#ffcc66}
+
+    /* Modal viewer */
+    .modal{
+      position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+      background:rgba(0,0,0,.72);z-index:9999;padding:18px;
+    }
+    .modalInner{
+      width:min(980px,100%);max-height:90vh;
+      border:1px solid var(--border);border-radius:18px;
+      background:#0c0c0c;box-shadow:var(--shadow);overflow:hidden;
+      display:flex;flex-direction:column;
+    }
+    .modalTop{
+      padding:10px 12px;border-bottom:1px solid #1b1b1b;
+      display:flex;align-items:center;justify-content:space-between;gap:10px
+    }
+    .modalTitle{font-weight:900}
+    .modalBody{padding:12px;display:flex;justify-content:center;align-items:center;overflow:auto}
+    .modalImg{max-width:100%;max-height:75vh;border-radius:14px;border:1px solid var(--border)}
+
     @media (max-width: 980px){
-      .ws{grid-template-columns: 1fr}
       .sidebar{display:none}
     }
   </style>
 </head>
 <body>
+
+<div class="modal" id="modal">
+  <div class="modalInner">
+    <div class="modalTop">
+      <div class="modalTitle" id="modalTitle">Preview</div>
+      <div class="stack">
+        <button class="btn small" id="modalDownload">Download</button>
+        <button class="btn small" id="modalClose">Close</button>
+      </div>
+    </div>
+    <div class="modalBody">
+      <img id="modalImg" class="modalImg" src="" alt="preview"/>
+    </div>
+  </div>
+</div>
+
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
@@ -610,17 +653,12 @@ def chat_ui():
     </div>
 
     <div class="stack">
-      <button class="btn small" id="uploadBtn">Upload file (server)</button>
+      <button class="btn small" id="uploadBtn">Attach file</button>
       <input id="filePicker" type="file" />
     </div>
 
-    <div class="stack">
-      <button class="btn small" id="wsAddBtn">Add to Workspace</button>
-      <input id="wsPicker" type="file" multiple />
-    </div>
-
     <div class="pill">
-      Workspace is local in-browser (free). Export ZIP to download edits.
+      ChatGPT-like: Attachments appear inside your message bubble. Images support Edit + Regenerate + Modal.
     </div>
   </aside>
 
@@ -628,71 +666,32 @@ def chat_ui():
     <div class="topbar">
       <div class="tabs">
         <button class="tab active" id="tabChat">Chat</button>
-        <button class="tab" id="tabWS">Workspace</button>
-        <div class="pill">Streaming • ChatGPT-style • Workspace</div>
+        <div class="pill">Streaming • Attachments • Image Edit</div>
       </div>
       <div class="stack right">
-        <button class="btn small" id="regenerate">Regenerate</button>
+        <button class="btn small" id="regenerateChat">Regenerate chat</button>
         <button class="btn small" id="clear">Clear</button>
       </div>
     </div>
 
     <div class="content">
       <div class="chatWrap" id="chatView"></div>
-
-      <div class="ws" id="wsView" style="display:none">
-        <div class="card">
-          <div class="cardHead">
-            <div class="pill">Workspace Files</div>
-            <div class="stack">
-              <button class="btn small" id="wsRemove">Remove</button>
-              <button class="btn small" id="wsClearAll">Clear</button>
-            </div>
-          </div>
-          <div class="cardBody">
-            <div class="fileMeta" id="wsStats">0 files</div>
-            <div class="fileList" id="wsFiles"></div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="cardHead">
-            <div class="pill">Editor</div>
-            <div class="stack">
-              <button class="btn small" id="wsSave">Save</button>
-              <button class="btn small" id="wsDownloadOne">Download File</button>
-              <button class="btn small" id="wsZip">Download ZIP</button>
-            </div>
-          </div>
-          <div class="cardBody">
-            <div class="row">
-              <input type="text" id="wsName" placeholder="path/to/file.ext" style="flex:1"/>
-              <span class="fileMeta" id="wsSize"></span>
-            </div>
-            <textarea class="mono wsEditor" id="wsEditor" placeholder="Select a file in the left panel..."></textarea>
-
-            <div class="row" style="margin-top:10px">
-              <input type="text" id="wsInstr" placeholder="Tell EFECT what to change across files (e.g. fix Verse errors, refactor, rename, add features)..." style="flex:1"/>
-              <button class="btn primary" id="wsApplyAI">Apply EFECT Edit</button>
-            </div>
-            <div class="fileMeta" id="wsNote"></div>
-            <div class="fileMeta warn" id="wsWarn"></div>
-          </div>
-        </div>
-      </div>
     </div>
 
     <div class="composer" id="composerChat">
       <div class="composerWrap">
 
         <div class="row">
-          <div class="pill">Uploads (server)</div>
+          <div class="pill">Pending attachments</div>
+          <button class="btn small" id="clearPending">Clear</button>
         </div>
-        <div class="previewRow" id="previews"></div>
+
+        <div class="attachTray" id="pendingTray"></div>
 
         <div class="row">
-          <span class="pill">Attach file IDs (optional)</span>
-          <input type="text" id="attachIds" placeholder="ab12cd34ef56, 1122aabbccdd" style="flex:1"/>
+          <div class="pill">Image edit prompt</div>
+          <input type="text" id="imgPrompt" placeholder='e.g. "make this pink and black"' style="flex:1"/>
+          <button class="btn small" id="imgEditBtn">Edit image</button>
         </div>
 
         <textarea id="msg" placeholder="Message EFECT AI… (Enter to send, Shift+Enter newline)"></textarea>
@@ -703,142 +702,91 @@ def chat_ui():
         </div>
       </div>
     </div>
-
-    <div class="composer" id="composerWS" style="display:none">
-      <div class="composerWrap">
-        <div class="row">
-          <div class="pill">Workspace Mode</div>
-          <div class="fileMeta">Use “Add to Workspace” to import text files. EFECT edits multiple files. Export ZIP.</div>
-        </div>
-      </div>
-    </div>
   </main>
 </div>
 
 <script>
   // ===========================
-  // Shared state
+  // State
   // ===========================
   const chatView = document.getElementById('chatView');
-  const wsView = document.getElementById('wsView');
-  const composerChat = document.getElementById('composerChat');
-  const composerWS = document.getElementById('composerWS');
-
-  const tabChat = document.getElementById('tabChat');
-  const tabWS = document.getElementById('tabWS');
-
   const sessionsEl = document.getElementById('sessions');
   const msgEl = document.getElementById('msg');
   const modelEl = document.getElementById('model');
   const memEl = document.getElementById('mem');
   const knEl = document.getElementById('kn');
   const typingEl = document.getElementById('typing');
-  const attachEl = document.getElementById('attachIds');
   const renameInput = document.getElementById('renameInput');
   const filePicker = document.getElementById('filePicker');
-  const previewsEl = document.getElementById('previews');
+  const pendingTray = document.getElementById('pendingTray');
 
-  const wsPicker = document.getElementById('wsPicker');
-  const wsFilesEl = document.getElementById('wsFiles');
-  const wsStatsEl = document.getElementById('wsStats');
-  const wsNameEl = document.getElementById('wsName');
-  const wsEditorEl = document.getElementById('wsEditor');
-  const wsSizeEl = document.getElementById('wsSize');
-  const wsInstrEl = document.getElementById('wsInstr');
-  const wsNoteEl = document.getElementById('wsNote');
-  const wsWarnEl = document.getElementById('wsWarn');
+  const imgPromptEl = document.getElementById('imgPrompt');
+
+  // Modal
+  const modal = document.getElementById('modal');
+  const modalImg = document.getElementById('modalImg');
+  const modalTitle = document.getElementById('modalTitle');
+  const modalClose = document.getElementById('modalClose');
+  const modalDownload = document.getElementById('modalDownload');
+  let modalDownloadName = 'download.png';
+  let modalDownloadUrl = '';
+
+  function openModal(url, title, dlName){
+    modalImg.src = url;
+    modalTitle.textContent = title || 'Preview';
+    modalDownloadName = dlName || 'download.png';
+    modalDownloadUrl = url;
+    modal.style.display = 'flex';
+  }
+  function closeModal(){
+    modal.style.display = 'none';
+    modalImg.src = '';
+    modalDownloadUrl = '';
+  }
+  modalClose.onclick = closeModal;
+  modal.onclick = (e)=>{ if(e.target === modal) closeModal(); };
+  modalDownload.onclick = ()=>{
+    if(!modalDownloadUrl) return;
+    const a = document.createElement('a');
+    a.href = modalDownloadUrl;
+    a.download = modalDownloadName;
+    document.body.appendChild(a); a.click(); a.remove();
+  };
 
   let sessionId = localStorage.getItem('efect_session_id') || '';
   let lastUserMessage = '';
 
-  // Workspace in-browser
-  let ws = new Map(); // name -> content
-  let wsActive = '';  // current file name
+  // Pending attachments (ChatGPT-like)
+  // Each item: { kind:'server'|'local', type:'image'|'file', name, size, file, url, file_id, content_type, preview_url }
+  let pending = [];
+
+  // Image edit regenerate memory
+  // lastImageEdit = { imageFile: File, prompt: string }
+  let lastImageEdit = null;
 
   const TEXT_EXTS = new Set(['txt','log','md','json','verse','ini','cfg','yaml','yml','csv','py','js','ts','html','css','tsx','jsx']);
-
   function isTextName(name){
     const ext = (name.split('.').pop() || '').toLowerCase();
     return TEXT_EXTS.has(ext);
   }
 
-  function byteLen(s){ return new TextEncoder().encode(s || '').length; }
-
-  function updateWsStats(){
-    let total = 0;
-    for (const [k,v] of ws.entries()) total += byteLen(v);
-    wsStatsEl.textContent = `${ws.size} files • ${(total/1024).toFixed(1)} KB`;
+  function fmtBytes(n){
+    if(!n && n !== 0) return '';
+    const kb = n/1024;
+    if(kb < 1024) return kb.toFixed(1) + ' KB';
+    return (kb/1024).toFixed(1) + ' MB';
   }
 
-  function renderWsFiles(){
-    wsFilesEl.innerHTML = '';
-    const names = Array.from(ws.keys()).sort((a,b)=>a.localeCompare(b));
-    names.forEach(name=>{
-      const div = document.createElement('div');
-      div.className = 'fileItem' + (name===wsActive ? ' active' : '');
-      const size = (byteLen(ws.get(name))/1024).toFixed(1) + ' KB';
-      div.innerHTML = `<div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px">${name}</div>
-                       <div class="fileMeta">${size}</div>`;
-      div.onclick = ()=> openWsFile(name);
-      wsFilesEl.appendChild(div);
-    });
-    updateWsStats();
-  }
-
-  function openWsFile(name){
-    wsActive = name;
-    wsNameEl.value = name;
-    wsEditorEl.value = ws.get(name) || '';
-    wsSizeEl.textContent = (byteLen(wsEditorEl.value)/1024).toFixed(1) + ' KB';
-    wsNoteEl.textContent = '';
-    wsWarnEl.textContent = '';
-    renderWsFiles();
-  }
-
-  function saveWsActive(){
-    const name = (wsNameEl.value || '').trim();
-    if(!name){ wsWarnEl.textContent = 'Filename is empty.'; return; }
-    const content = wsEditorEl.value || '';
-    // allow rename
-    if(wsActive && wsActive !== name){
-      ws.delete(wsActive);
-    }
-    ws.set(name, content);
-    wsActive = name;
-    wsSizeEl.textContent = (byteLen(content)/1024).toFixed(1) + ' KB';
-    wsWarnEl.textContent = '';
-    renderWsFiles();
-  }
-
-  function downloadText(filename, content){
-    const blob = new Blob([content], {type:'text/plain;charset=utf-8'});
-    const url = URL.createObjectURL(blob);
+  function downloadBlobUrl(url, filename){
     const a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = filename || 'download';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
-  function switchTab(which){
-    if(which==='chat'){
-      tabChat.classList.add('active'); tabWS.classList.remove('active');
-      chatView.style.display='flex'; wsView.style.display='none';
-      composerChat.style.display='flex'; composerWS.style.display='none';
-    } else {
-      tabWS.classList.add('active'); tabChat.classList.remove('active');
-      chatView.style.display='none'; wsView.style.display='grid';
-      composerChat.style.display='none'; composerWS.style.display='flex';
-      renderWsFiles();
-    }
-  }
-
-  tabChat.onclick = ()=>switchTab('chat');
-  tabWS.onclick = ()=>switchTab('ws');
-
-  // ===========================
-  // Chat helpers
-  // ===========================
-  function addMsg(role, text){
+  function addMsg(role, text, attachments){
     const wrap = document.createElement('div');
     wrap.className = 'msg ' + (role==='user' ? 'user' : 'ai');
 
@@ -851,49 +799,148 @@ def chat_ui():
     const copyBtn = document.createElement('button');
     copyBtn.className = 'btn small';
     copyBtn.textContent = 'Copy';
-    copyBtn.onclick = async ()=>{ try{ await navigator.clipboard.writeText(text); }catch(e){} };
+    copyBtn.onclick = async ()=>{ try{ await navigator.clipboard.writeText(text || ''); }catch(e){} };
     tools.appendChild(copyBtn);
     head.appendChild(tools);
 
-    const body = document.createElement('div');
-    body.textContent = text;
-
     wrap.appendChild(head);
-    wrap.appendChild(body);
+
+    if(attachments && attachments.length){
+      const tray = document.createElement('div');
+      tray.className = 'attachTray';
+      attachments.forEach(att=>{
+        tray.appendChild(renderAttachmentCard(att));
+      });
+      wrap.appendChild(tray);
+    }
+
+    if(text && text.length){
+      const body = document.createElement('div');
+      body.textContent = text;
+      wrap.appendChild(body);
+    }
+
     chatView.appendChild(wrap);
     chatView.scrollTop = chatView.scrollHeight;
-    return body;
+    return wrap;
   }
 
-  function parseAttach(){
-    const raw = attachEl.value.trim();
-    if(!raw) return null;
-    return raw.split(',').map(x=>x.trim()).filter(Boolean);
+  function renderAttachmentCard(att){
+    const card = document.createElement('div');
+    card.className = 'attachCard';
+
+    const info = document.createElement('div');
+    info.className = 'attachInfo';
+
+    const name = document.createElement('div');
+    name.className = 'attachName';
+    name.textContent = att.name || 'attachment';
+
+    const meta = document.createElement('div');
+    meta.className = 'attachMeta';
+    meta.textContent = `${att.type === 'image' ? 'Image' : 'File'} • ${fmtBytes(att.size)}${att.file_id ? ' • id: '+att.file_id : ''}`;
+
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'attachActions';
+
+    if(att.type === 'image'){
+      const img = document.createElement('img');
+      img.className = 'attachThumb';
+      img.src = att.url || att.preview_url || '';
+      img.alt = att.name || 'image';
+      img.onclick = ()=> openModal(img.src, att.name, (att.name || 'image') );
+
+      card.appendChild(img);
+
+      const viewBtn = document.createElement('button');
+      viewBtn.className = 'btn small';
+      viewBtn.textContent = 'View';
+      viewBtn.onclick = ()=> openModal(img.src, att.name, (att.name || 'image'));
+
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'btn small';
+      dlBtn.textContent = 'Download';
+      dlBtn.onclick = async ()=>{
+        if(att.kind === 'server' && att.file_id){
+          // download through authenticated endpoint if enabled
+          window.open(`/api/files/${att.file_id}`, '_blank');
+        } else {
+          downloadBlobUrl(img.src, att.name || 'image.png');
+        }
+      };
+
+      actions.appendChild(viewBtn);
+      actions.appendChild(dlBtn);
+    } else {
+      // non-image file card
+      const icon = document.createElement('div');
+      icon.className = 'attachThumb mono';
+      icon.style.display='flex';
+      icon.style.alignItems='center';
+      icon.style.justifyContent='center';
+      icon.style.fontSize='12px';
+      icon.textContent = (att.name || 'file').split('.').pop().toUpperCase().slice(0,5);
+      card.appendChild(icon);
+
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'btn small';
+      dlBtn.textContent = 'Download';
+      dlBtn.onclick = ()=>{
+        if(att.kind === 'server' && att.file_id){
+          window.open(`/api/files/${att.file_id}`, '_blank');
+        } else if(att.url){
+          downloadBlobUrl(att.url, att.name || 'file');
+        }
+      };
+      actions.appendChild(dlBtn);
+    }
+
+    card.appendChild(info);
+    card.appendChild(actions);
+    return card;
   }
 
-  function addPreview(file){
-    if(!file || !file.content_type || !file.content_type.startsWith('image/')) return;
-    if(!file.preview_url) return;
-
-    const wrap = document.createElement('div');
-    wrap.className = 'thumbWrap';
-
-    const img = document.createElement('img');
-    img.className = 'thumb';
-    img.src = file.preview_url;
-    img.alt = file.filename || 'image';
-
-    img.onclick = ()=> window.open(file.preview_url, '_blank');
-
-    const cap = document.createElement('div');
-    cap.className = 'thumbCap';
-    cap.textContent = file.filename || file.id;
-
-    wrap.appendChild(img);
-    wrap.appendChild(cap);
-    previewsEl.prepend(wrap);
+  function renderPendingTray(){
+    pendingTray.innerHTML = '';
+    if(pending.length === 0){
+      const empty = document.createElement('div');
+      empty.className = 'pill';
+      empty.textContent = 'No pending attachments.';
+      pendingTray.appendChild(empty);
+      return;
+    }
+    pending.forEach((att, idx)=>{
+      const card = renderAttachmentCard(att);
+      // add remove btn
+      const rm = document.createElement('button');
+      rm.className = 'btn small';
+      rm.textContent = 'Remove';
+      rm.onclick = ()=>{
+        pending.splice(idx,1);
+        renderPendingTray();
+      };
+      card.querySelector('.attachActions').appendChild(rm);
+      pendingTray.appendChild(card);
+    });
   }
 
+  function pendingServerIds(){
+    return pending.filter(x=>x.kind==='server' && x.file_id).map(x=>x.file_id);
+  }
+
+  function lastPendingImage(){
+    for(let i=pending.length-1;i>=0;i--){
+      if(pending[i].type==='image') return pending[i];
+    }
+    return null;
+  }
+
+  // ===========================
+  // Sessions
+  // ===========================
   async function loadSessions(){
     sessionsEl.innerHTML = '';
     const r = await fetch('/api/sessions');
@@ -915,62 +962,6 @@ def chat_ui():
     });
   }
 
-  async function sendStream(message){
-    typingEl.style.display = 'block';
-
-    const res = await fetch('/api/chat_stream', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        message,
-        session_id: sessionId || null,
-        model: modelEl.value,
-        use_memory: memEl.checked,
-        use_knowledge: knEl.checked,
-        top_k: 3,
-        file_ids: parseAttach()
-      })
-    });
-
-    const newSid = res.headers.get('x-efect-session-id');
-    if (newSid) {
-      sessionId = newSid;
-      localStorage.setItem('efect_session_id', sessionId);
-    }
-
-    const aiBodyNode = addMsg('assistant', '');
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-
-    let full = '';
-    while(true){
-      const {value, done} = await reader.read();
-      if(done) break;
-      const chunk = decoder.decode(value, {stream:true});
-      full += chunk;
-      aiBodyNode.textContent = full;
-      chatView.scrollTop = chatView.scrollHeight;
-    }
-
-    typingEl.style.display = 'none';
-    await loadSessions();
-    return full;
-  }
-
-  async function send(){
-    const text = msgEl.value.trim();
-    if(!text) return;
-    msgEl.value = '';
-    lastUserMessage = text;
-    addMsg('user', text);
-    await sendStream(text);
-  }
-
-  async function regenerate(){
-    if(!lastUserMessage) return;
-    await sendStream(lastUserMessage);
-  }
-
   async function renameChat(){
     const title = renameInput.value.trim();
     if(!title || !sessionId) return;
@@ -984,10 +975,80 @@ def chat_ui():
   }
 
   // ===========================
-  // Server upload (any file) - preserves image previews
+  // Chat streaming
   // ===========================
-  async function uploadPickedFile(file){
-    if(!file) return;
+  async function sendStream(message, attachmentsForBubble){
+    typingEl.style.display = 'block';
+
+    const res = await fetch('/api/chat_stream', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        message,
+        session_id: sessionId || null,
+        model: modelEl.value,
+        use_memory: memEl.checked,
+        use_knowledge: knEl.checked,
+        top_k: 3,
+        file_ids: pendingServerIds()
+      })
+    });
+
+    const newSid = res.headers.get('x-efect-session-id');
+    if (newSid) {
+      sessionId = newSid;
+      localStorage.setItem('efect_session_id', sessionId);
+    }
+
+    // show user bubble with inline attachments (ChatGPT feel)
+    addMsg('user', message, attachmentsForBubble || []);
+
+    const aiWrap = addMsg('assistant', '', []);
+    const aiBody = document.createElement('div');
+    aiWrap.appendChild(aiBody);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    let full = '';
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      const chunk = decoder.decode(value, {stream:true});
+      full += chunk;
+      aiBody.textContent = full;
+      chatView.scrollTop = chatView.scrollHeight;
+    }
+
+    typingEl.style.display = 'none';
+    await loadSessions();
+    return full;
+  }
+
+  async function send(){
+    const text = msgEl.value.trim();
+    if(!text) return;
+
+    // take snapshot of pending attachments into this message bubble
+    const snapshot = pending.slice();
+    // clear pending (like ChatGPT)
+    pending = [];
+    renderPendingTray();
+
+    msgEl.value = '';
+    lastUserMessage = text;
+    await sendStream(text, snapshot);
+  }
+
+  async function regenerateChat(){
+    if(!lastUserMessage) return;
+    await sendStream(lastUserMessage, []);
+  }
+
+  // ===========================
+  // Server upload (adds to pending)
+  // ===========================
+  async function uploadToServer(file){
     const fd = new FormData();
     fd.append('file', file);
 
@@ -995,135 +1056,129 @@ def chat_ui():
     const data = await r.json();
 
     if(data && data.file && data.file.id){
-      const current = attachEl.value.trim();
-      attachEl.value = current ? (current + ', ' + data.file.id) : data.file.id;
-
-      addPreview(data.file);
-      addMsg('assistant', `Uploaded (server) "${data.file.filename}" → file_id: ${data.file.id}. (Added to Attach IDs)`);
+      const f = data.file;
+      const isImg = (f.content_type || '').startsWith('image/');
+      const att = {
+        kind: 'server',
+        type: isImg ? 'image' : 'file',
+        name: f.filename,
+        size: f.bytes,
+        file_id: f.id,
+        content_type: f.content_type,
+        preview_url: f.preview_url,
+        url: isImg ? f.preview_url : ''
+      };
+      pending.push(att);
+      renderPendingTray();
+      addMsg('assistant', `Attached "${f.filename}" to your pending attachments. Send a message to include it in chat.`, []);
     } else {
-      addMsg('assistant', 'Upload failed: ' + JSON.stringify(data));
+      addMsg('assistant', 'Upload failed: ' + JSON.stringify(data), []);
     }
   }
 
   // ===========================
-  // Workspace import (text files, multi)
+  // Image Edit + Regenerate
   // ===========================
-  async function addFilesToWorkspace(fileList){
-    const files = Array.from(fileList || []);
-    if(files.length === 0) return;
+  async function runImageEdit(imageFile, prompt, originalName){
+    typingEl.style.display = 'block';
 
-    for(const f of files){
-      const name = (f.webkitRelativePath && f.webkitRelativePath.length) ? f.webkitRelativePath : f.name;
-      if(!isTextName(name)){
-        wsWarnEl.textContent = `Skipped non-text file in workspace: ${name}`;
-        continue;
-      }
-      const text = await f.text();
-      ws.set(name.replace('\\','/'), text);
-    }
+    const fd = new FormData();
+    fd.append('prompt', prompt);
+    fd.append('image', imageFile);
 
-    // open first file if none active
-    if(!wsActive && ws.size>0){
-      const first = Array.from(ws.keys()).sort()[0];
-      openWsFile(first);
-    } else {
-      renderWsFiles();
-    }
-  }
-
-  // ===========================
-  // Workspace -> EFECT edit (multi-file)
-  // ===========================
-  async function applyWorkspaceAI(){
-    saveWsActive();
-
-    const instr = (wsInstrEl.value || '').trim();
-    if(!instr){
-      wsWarnEl.textContent = 'Write instructions first (what to change across files).';
-      return;
-    }
-    if(ws.size === 0){
-      wsWarnEl.textContent = 'Workspace is empty. Add files first.';
-      return;
-    }
-
-    wsWarnEl.textContent = '';
-    wsNoteEl.textContent = 'Applying EFECT edit to workspace...';
-
-    // build plain object
-    const filesObj = {};
-    for (const [k,v] of ws.entries()) filesObj[k] = v;
-
-    const r = await fetch('/api/edit_workspace', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        instructions: instr,
-        files: filesObj,
-        model: modelEl.value
-      })
-    });
-
-    const data = await r.json();
-    if(!data || !data.files){
-      wsWarnEl.textContent = 'Edit failed: ' + JSON.stringify(data);
-      wsNoteEl.textContent = '';
-      return;
-    }
-
-    // update workspace
-    const updated = data.files;
-    ws = new Map(Object.entries(updated));
-
-    renderWsFiles();
-
-    // keep active file if exists
-    if(wsActive && ws.has(wsActive)){
-      openWsFile(wsActive);
-    } else {
-      const first = Array.from(ws.keys()).sort()[0];
-      if(first) openWsFile(first);
-    }
-
-    wsNoteEl.textContent = data.notes ? String(data.notes) : 'Workspace updated.';
-  }
-
-  // ===========================
-  // Workspace ZIP export (server builds zip)
-  // ===========================
-  async function downloadWorkspaceZip(){
-    saveWsActive();
-    if(ws.size === 0){
-      wsWarnEl.textContent = 'Workspace is empty.';
-      return;
-    }
-    wsWarnEl.textContent = '';
-
-    const filesObj = {};
-    for (const [k,v] of ws.entries()) filesObj[k] = v;
-
-    const r = await fetch('/api/workspace/export_zip', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        files: filesObj,
-        zip_name: 'EFECT_workspace.zip'
-      })
-    });
+    const r = await fetch('/api/image_edit', { method:'POST', body: fd });
+    typingEl.style.display = 'none';
 
     if(!r.ok){
-      wsWarnEl.textContent = 'ZIP export failed.';
+      const t = await r.text();
+      addMsg('assistant', 'Image edit failed: ' + t, []);
       return;
     }
+
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
 
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'EFECT_workspace.zip';
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    // Remember for regenerate
+    lastImageEdit = { imageFile, prompt, originalName: originalName || imageFile.name || 'image.png' };
+
+    // Show as AI message with attachment card
+    const editedAtt = {
+      kind: 'local',
+      type: 'image',
+      name: `Edited_${(originalName || imageFile.name || 'image').replace(/\s+/g,'_')}.png`,
+      size: blob.size,
+      url: url
+    };
+
+    const aiMsg = addMsg('assistant', `Image edit: ${prompt}`, [editedAtt]);
+
+    // Add regenerate button under the message (ChatGPT feel)
+    const controls = document.createElement('div');
+    controls.className = 'row';
+    controls.style.marginTop = '10px';
+
+    const regen = document.createElement('button');
+    regen.className = 'btn small';
+    regen.textContent = 'Regenerate';
+    regen.onclick = async ()=>{
+      if(!lastImageEdit) return;
+      await runImageEdit(lastImageEdit.imageFile, lastImageEdit.prompt, lastImageEdit.originalName);
+    };
+
+    const view = document.createElement('button');
+    view.className = 'btn small';
+    view.textContent = 'View';
+    view.onclick = ()=> openModal(url, editedAtt.name, editedAtt.name);
+
+    const dl = document.createElement('button');
+    dl.className = 'btn small';
+    dl.textContent = 'Download';
+    dl.onclick = ()=> downloadBlobUrl(url, editedAtt.name);
+
+    controls.appendChild(regen);
+    controls.appendChild(view);
+    controls.appendChild(dl);
+    aiMsg.appendChild(controls);
+
+    chatView.scrollTop = chatView.scrollHeight;
   }
+
+  document.getElementById('imgEditBtn').onclick = async ()=>{
+    const prompt = (imgPromptEl.value || '').trim();
+    if(!prompt){
+      addMsg('assistant','Type an image edit instruction first (example: "make this pink and black").', []);
+      return;
+    }
+
+    const imgAtt = lastPendingImage();
+    if(!imgAtt){
+      addMsg('assistant','Attach an image first using “Attach file”. It will appear in Pending attachments.', []);
+      return;
+    }
+
+    // Prefer local file if we have it; but pending uses server upload.
+    // For ChatGPT-like behavior without paid storage, we edit from the local file BEFORE uploading.
+    // Here we only have server item, so we prompt user to re-attach as local OR we fetch and blob it.
+    // We will fetch preview_url and convert to File.
+    let fileToEdit = null;
+
+    try{
+      const resp = await fetch(imgAtt.preview_url || imgAtt.url);
+      const blob = await resp.blob();
+      const name = imgAtt.name || 'image.png';
+      fileToEdit = new File([blob], name, { type: blob.type || 'image/png' });
+    }catch(e){
+      addMsg('assistant', 'Could not load the attached image for editing. Re-attach the image and try again.', []);
+      return;
+    }
+
+    // Show user “tool action” bubble with the image attachment + prompt
+    addMsg('user', `[Image Edit] ${prompt}`, [imgAtt]);
+
+    await runImageEdit(fileToEdit, prompt, imgAtt.name || fileToEdit.name);
+  };
+
+  document.getElementById('regenerateChat').onclick = regenerateChat;
 
   // ===========================
   // Wire UI
@@ -1133,16 +1188,30 @@ def chat_ui():
     sessionId = '';
     localStorage.removeItem('efect_session_id');
     chatView.innerHTML = '';
-    previewsEl.innerHTML = '';
-    addMsg('assistant', 'New chat started.');
+    pending = [];
+    renderPendingTray();
+    addMsg('assistant', 'New chat started.', []);
     loadSessions();
   };
-  document.getElementById('clear').onclick = ()=>{
-    chatView.innerHTML = '';
-  };
-  document.getElementById('regenerate').onclick = regenerate;
+  document.getElementById('clear').onclick = ()=>{ chatView.innerHTML = ''; };
   document.getElementById('renameBtn').onclick = renameChat;
   document.getElementById('refreshSessions').onclick = loadSessions;
+
+  document.getElementById('uploadBtn').onclick = ()=> filePicker.click();
+  filePicker.addEventListener('change', async (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if(!f) return;
+
+    // Upload to server so it can be used as chat attachment IDs.
+    // (Also enables image edit by fetching preview_url)
+    await uploadToServer(f);
+    filePicker.value = '';
+  });
+
+  document.getElementById('clearPending').onclick = ()=>{
+    pending = [];
+    renderPendingTray();
+  };
 
   msgEl.addEventListener('keydown', (e)=>{
     if(e.key==='Enter' && !e.shiftKey){
@@ -1151,53 +1220,8 @@ def chat_ui():
     }
   });
 
-  // Server upload picker
-  document.getElementById('uploadBtn').onclick = ()=> filePicker.click();
-  filePicker.addEventListener('change', async (e)=>{
-    const f = e.target.files && e.target.files[0];
-    await uploadPickedFile(f);
-    filePicker.value = '';
-  });
-
-  // Workspace picker
-  document.getElementById('wsAddBtn').onclick = ()=> wsPicker.click();
-  wsPicker.addEventListener('change', async (e)=>{
-    await addFilesToWorkspace(e.target.files);
-    wsPicker.value = '';
-  });
-
-  // Workspace controls
-  document.getElementById('wsSave').onclick = saveWsActive;
-  document.getElementById('wsApplyAI').onclick = applyWorkspaceAI;
-  document.getElementById('wsZip').onclick = downloadWorkspaceZip;
-
-  document.getElementById('wsDownloadOne').onclick = ()=>{
-    saveWsActive();
-    if(!wsActive){ wsWarnEl.textContent = 'No file selected.'; return; }
-    downloadText(wsActive.split('/').pop() || 'file.txt', ws.get(wsActive) || '');
-  };
-
-  document.getElementById('wsRemove').onclick = ()=>{
-    if(!wsActive){ wsWarnEl.textContent='No file selected.'; return; }
-    ws.delete(wsActive);
-    wsActive = '';
-    wsNameEl.value = '';
-    wsEditorEl.value = '';
-    renderWsFiles();
-    wsWarnEl.textContent = 'Removed file.';
-  };
-
-  document.getElementById('wsClearAll').onclick = ()=>{
-    ws.clear();
-    wsActive = '';
-    wsNameEl.value = '';
-    wsEditorEl.value = '';
-    wsInstrEl.value = '';
-    renderWsFiles();
-    wsWarnEl.textContent = 'Workspace cleared.';
-  };
-
-  addMsg('assistant', 'Ready. Chat streaming is on. Workspace mode is available.');
+  addMsg('assistant', 'Ready. Attach files → they appear in your message bubble when you Send. Use Image Edit for ChatGPT-style edits (Regenerate + Modal included).', []);
+  renderPendingTray();
   loadSessions();
 </script>
 </body>
@@ -1447,19 +1471,6 @@ def save_assistant_turn_and_summary(sid: str, reply: str, model: str) -> None:
 
 
 # ---------------------------
-# Non-stream chat
-# ---------------------------
-@app.post("/api/chat_v2")
-def chat_v2(req: ChatV2Request):
-    sid = req.session_id or str(uuid.uuid4())
-    model = (req.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    messages, sid = build_messages_for_request(req, sid, model)
-    reply = openai_responses(messages, model)
-    save_assistant_turn_and_summary(sid, reply, model)
-    return {"session_id": sid, "reply": reply}
-
-
-# ---------------------------
 # Streaming chat
 # ---------------------------
 @app.post("/api/chat_stream")
@@ -1488,68 +1499,10 @@ def chat_stream(req: ChatV2Request):
 
 
 # =========================================================
-# WORKSPACE MODE API
+# Optional: workspace ZIP export endpoints (kept for later)
 # =========================================================
-@app.post("/api/edit_workspace")
-def edit_workspace(req: EditWorkspaceRequest):
-    """
-    Takes {instructions, files{name:content}} and returns updated files + optional notes.
-    """
-    model = (req.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    files = clamp_workspace(req.files or {})
-    if not files:
-        return {"error": "No files provided", "files": {}}
-
-    # Build a compact view for the model
-    # (We include file names and contents, and ask for strict JSON output.)
-    payload = {
-        "instructions": req.instructions,
-        "files": files,
-        "output_format": {
-            "files": {"<path>": "<updated content>"},
-            "notes": "short summary of what changed"
-        }
-    }
-
-    messages = [
-        {"role": "system", "content":
-            default_system_prompt() +
-            "\n\nYou are in WORKSPACE MODE. You must edit multiple files.\n"
-            "Return ONLY valid JSON with keys: files, notes.\n"
-            "files must include ONLY the files that exist in the input (same keys), with updated full contents.\n"
-            "Do not add markdown, code fences, or extra commentary outside JSON."
-        },
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-    ]
-
-    out = openai_responses(messages, model)
-
-    # Parse JSON strictly
-    try:
-        data = json.loads(out)
-        updated = data.get("files", {})
-        notes = data.get("notes", "")
-        if not isinstance(updated, dict):
-            raise ValueError("files is not a dict")
-        # Keep only keys that were provided (no surprises)
-        cleaned = {}
-        for k in files.keys():
-            v = updated.get(k, files[k])
-            if not isinstance(v, str):
-                v = files[k]
-            cleaned[k] = v
-        cleaned = clamp_workspace(cleaned)
-        return {"files": cleaned, "notes": notes}
-    except Exception:
-        # If model returns non-JSON, fail gracefully with raw text
-        return {"error": "Model did not return valid JSON", "raw": out, "files": files}
-
-
 @app.post("/api/workspace/export_zip")
 def export_workspace_zip(req: ExportWorkspaceZipRequest):
-    """
-    Returns a zip file from provided workspace files (in-memory).
-    """
     files = clamp_workspace(req.files or {})
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
