@@ -10,7 +10,7 @@ import mimetypes
 import io
 import zipfile
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, List, Tuple
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Request, Form
@@ -45,7 +45,7 @@ MAX_ATTACH_TEXT_BYTES = MAX_ATTACH_TEXT_KB * 1024
 
 PREVIEW_TOKEN_TTL_SECONDS = int(os.getenv("EFECT_PREVIEW_TTL_SECONDS", "86400"))  # 24h default
 
-# Workspace limits (keep stable)
+# Workspace limits (kept for later)
 WORKSPACE_MAX_FILES = int(os.getenv("EFECT_WORKSPACE_MAX_FILES", "80"))
 WORKSPACE_MAX_TOTAL_KB = int(os.getenv("EFECT_WORKSPACE_MAX_TOTAL_KB", "1500"))
 WORKSPACE_MAX_TOTAL_BYTES = WORKSPACE_MAX_TOTAL_KB * 1024
@@ -83,7 +83,6 @@ def init_db() -> None:
         updated_at INTEGER NOT NULL
     )
     """)
-    # Migration: title column
     try:
         cur.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
     except sqlite3.OperationalError:
@@ -342,9 +341,7 @@ def rank_knowledge(query: str, top_k: int) -> List[Dict[str, str]]:
 # =========================================================
 # FILE HELPERS
 # =========================================================
-TEXT_EXTS = {
-    "txt", "log", "md", "json", "verse", "ini", "cfg", "yaml", "yml", "csv", "py", "js", "ts", "html", "css"
-}
+TEXT_EXTS = {"txt", "log", "md", "json", "verse", "ini", "cfg", "yaml", "yml", "csv", "py", "js", "ts", "html", "css"}
 
 
 def is_text_like(filename: str, content_type: str) -> bool:
@@ -406,12 +403,6 @@ class SessionRenameRequest(BaseModel):
     title: str
 
 
-class EditWorkspaceRequest(BaseModel):
-    instructions: str
-    files: Dict[str, str]
-    model: Optional[str] = None
-
-
 class ExportWorkspaceZipRequest(BaseModel):
     files: Dict[str, str]
     zip_name: Optional[str] = None
@@ -426,7 +417,7 @@ def root():
 
 
 # ---------------------------
-# IMAGE EDIT (ChatGPT-style)
+# IMAGE EDIT (triggered by Send in UI)
 # ---------------------------
 @app.post("/api/image_edit")
 async def image_edit(
@@ -434,10 +425,6 @@ async def image_edit(
     image: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    """
-    Upload an image + instruction prompt, returns edited image bytes (PNG).
-    No persistent storage required.
-    """
     require_token(authorization)
 
     if not OPENAI_API_KEY:
@@ -478,7 +465,7 @@ async def image_edit(
 
 
 # ---------------------------
-# Chat UI at /chat
+# Chat UI at /chat (UPDATED: image edit triggers on Send)
 # ---------------------------
 @app.get("/chat", response_class=HTMLResponse)
 def chat_ui():
@@ -658,15 +645,15 @@ def chat_ui():
     </div>
 
     <div class="pill">
-      ChatGPT-like: Attachments appear inside your message bubble. Images support Edit + Regenerate + Modal.
+      Attach image → type instruction → Send (auto image edit). No edit button required.
     </div>
   </aside>
 
   <main class="main">
     <div class="topbar">
       <div class="tabs">
-        <button class="tab active" id="tabChat">Chat</button>
-        <div class="pill">Streaming • Attachments • Image Edit</div>
+        <button class="tab active">Chat</button>
+        <div class="pill">Streaming • Attachments • Image Edit-on-Send</div>
       </div>
       <div class="stack right">
         <button class="btn small" id="regenerateChat">Regenerate chat</button>
@@ -678,7 +665,7 @@ def chat_ui():
       <div class="chatWrap" id="chatView"></div>
     </div>
 
-    <div class="composer" id="composerChat">
+    <div class="composer">
       <div class="composerWrap">
 
         <div class="row">
@@ -688,10 +675,10 @@ def chat_ui():
 
         <div class="attachTray" id="pendingTray"></div>
 
+        <!-- Optional: keep this field; if filled, it overrides message text for image edits -->
         <div class="row">
-          <div class="pill">Image edit prompt</div>
-          <input type="text" id="imgPrompt" placeholder='e.g. "make this pink and black"' style="flex:1"/>
-          <button class="btn small" id="imgEditBtn">Edit image</button>
+          <div class="pill">Image edit prompt (optional)</div>
+          <input type="text" id="imgPrompt" placeholder='leave blank to use message text' style="flex:1"/>
         </div>
 
         <textarea id="msg" placeholder="Message EFECT AI… (Enter to send, Shift+Enter newline)"></textarea>
@@ -706,9 +693,6 @@ def chat_ui():
 </div>
 
 <script>
-  // ===========================
-  // State
-  // ===========================
   const chatView = document.getElementById('chatView');
   const sessionsEl = document.getElementById('sessions');
   const msgEl = document.getElementById('msg');
@@ -719,7 +703,6 @@ def chat_ui():
   const renameInput = document.getElementById('renameInput');
   const filePicker = document.getElementById('filePicker');
   const pendingTray = document.getElementById('pendingTray');
-
   const imgPromptEl = document.getElementById('imgPrompt');
 
   // Modal
@@ -756,19 +739,11 @@ def chat_ui():
   let sessionId = localStorage.getItem('efect_session_id') || '';
   let lastUserMessage = '';
 
-  // Pending attachments (ChatGPT-like)
-  // Each item: { kind:'server'|'local', type:'image'|'file', name, size, file, url, file_id, content_type, preview_url }
+  // Pending attachments: { kind:'server', type:'image'|'file', name, size, file_id, content_type, preview_url, url }
   let pending = [];
 
   // Image edit regenerate memory
-  // lastImageEdit = { imageFile: File, prompt: string }
   let lastImageEdit = null;
-
-  const TEXT_EXTS = new Set(['txt','log','md','json','verse','ini','cfg','yaml','yml','csv','py','js','ts','html','css','tsx','jsx']);
-  function isTextName(name){
-    const ext = (name.split('.').pop() || '').toLowerCase();
-    return TEXT_EXTS.has(ext);
-  }
 
   function fmtBytes(n){
     if(!n && n !== 0) return '';
@@ -851,21 +826,20 @@ def chat_ui():
       img.className = 'attachThumb';
       img.src = att.url || att.preview_url || '';
       img.alt = att.name || 'image';
-      img.onclick = ()=> openModal(img.src, att.name, (att.name || 'image') );
+      img.onclick = ()=> openModal(img.src, att.name, (att.name || 'image.png'));
 
       card.appendChild(img);
 
       const viewBtn = document.createElement('button');
       viewBtn.className = 'btn small';
       viewBtn.textContent = 'View';
-      viewBtn.onclick = ()=> openModal(img.src, att.name, (att.name || 'image'));
+      viewBtn.onclick = ()=> openModal(img.src, att.name, (att.name || 'image.png'));
 
       const dlBtn = document.createElement('button');
       dlBtn.className = 'btn small';
       dlBtn.textContent = 'Download';
-      dlBtn.onclick = async ()=>{
+      dlBtn.onclick = ()=>{
         if(att.kind === 'server' && att.file_id){
-          // download through authenticated endpoint if enabled
           window.open(`/api/files/${att.file_id}`, '_blank');
         } else {
           downloadBlobUrl(img.src, att.name || 'image.png');
@@ -875,7 +849,6 @@ def chat_ui():
       actions.appendChild(viewBtn);
       actions.appendChild(dlBtn);
     } else {
-      // non-image file card
       const icon = document.createElement('div');
       icon.className = 'attachThumb mono';
       icon.style.display='flex';
@@ -891,8 +864,6 @@ def chat_ui():
       dlBtn.onclick = ()=>{
         if(att.kind === 'server' && att.file_id){
           window.open(`/api/files/${att.file_id}`, '_blank');
-        } else if(att.url){
-          downloadBlobUrl(att.url, att.name || 'file');
         }
       };
       actions.appendChild(dlBtn);
@@ -914,7 +885,6 @@ def chat_ui():
     }
     pending.forEach((att, idx)=>{
       const card = renderAttachmentCard(att);
-      // add remove btn
       const rm = document.createElement('button');
       rm.className = 'btn small';
       rm.textContent = 'Remove';
@@ -931,16 +901,13 @@ def chat_ui():
     return pending.filter(x=>x.kind==='server' && x.file_id).map(x=>x.file_id);
   }
 
-  function lastPendingImage(){
-    for(let i=pending.length-1;i>=0;i--){
-      if(pending[i].type==='image') return pending[i];
+  function lastImageFrom(list){
+    for(let i=list.length-1;i>=0;i--){
+      if(list[i].type==='image') return list[i];
     }
     return null;
   }
 
-  // ===========================
-  // Sessions
-  // ===========================
   async function loadSessions(){
     sessionsEl.innerHTML = '';
     const r = await fetch('/api/sessions');
@@ -956,7 +923,7 @@ def chat_ui():
         sessionId = s.session_id;
         localStorage.setItem('efect_session_id', sessionId);
         loadSessions();
-        addMsg('assistant', 'Switched chat. Continue here.');
+        addMsg('assistant', 'Switched chat. Continue here.', []);
       };
       sessionsEl.appendChild(d);
     });
@@ -974,9 +941,6 @@ def chat_ui():
     await loadSessions();
   }
 
-  // ===========================
-  // Chat streaming
-  // ===========================
   async function sendStream(message, attachmentsForBubble){
     typingEl.style.display = 'block';
 
@@ -1000,7 +964,6 @@ def chat_ui():
       localStorage.setItem('efect_session_id', sessionId);
     }
 
-    // show user bubble with inline attachments (ChatGPT feel)
     addMsg('user', message, attachmentsForBubble || []);
 
     const aiWrap = addMsg('assistant', '', []);
@@ -1025,60 +988,6 @@ def chat_ui():
     return full;
   }
 
-  async function send(){
-    const text = msgEl.value.trim();
-    if(!text) return;
-
-    // take snapshot of pending attachments into this message bubble
-    const snapshot = pending.slice();
-    // clear pending (like ChatGPT)
-    pending = [];
-    renderPendingTray();
-
-    msgEl.value = '';
-    lastUserMessage = text;
-    await sendStream(text, snapshot);
-  }
-
-  async function regenerateChat(){
-    if(!lastUserMessage) return;
-    await sendStream(lastUserMessage, []);
-  }
-
-  // ===========================
-  // Server upload (adds to pending)
-  // ===========================
-  async function uploadToServer(file){
-    const fd = new FormData();
-    fd.append('file', file);
-
-    const r = await fetch('/api/files/upload', { method:'POST', body: fd });
-    const data = await r.json();
-
-    if(data && data.file && data.file.id){
-      const f = data.file;
-      const isImg = (f.content_type || '').startsWith('image/');
-      const att = {
-        kind: 'server',
-        type: isImg ? 'image' : 'file',
-        name: f.filename,
-        size: f.bytes,
-        file_id: f.id,
-        content_type: f.content_type,
-        preview_url: f.preview_url,
-        url: isImg ? f.preview_url : ''
-      };
-      pending.push(att);
-      renderPendingTray();
-      addMsg('assistant', `Attached "${f.filename}" to your pending attachments. Send a message to include it in chat.`, []);
-    } else {
-      addMsg('assistant', 'Upload failed: ' + JSON.stringify(data), []);
-    }
-  }
-
-  // ===========================
-  // Image Edit + Regenerate
-  // ===========================
   async function runImageEdit(imageFile, prompt, originalName){
     typingEl.style.display = 'block';
 
@@ -1098,10 +1007,8 @@ def chat_ui():
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
 
-    // Remember for regenerate
     lastImageEdit = { imageFile, prompt, originalName: originalName || imageFile.name || 'image.png' };
 
-    // Show as AI message with attachment card
     const editedAtt = {
       kind: 'local',
       type: 'image',
@@ -1112,7 +1019,6 @@ def chat_ui():
 
     const aiMsg = addMsg('assistant', `Image edit: ${prompt}`, [editedAtt]);
 
-    // Add regenerate button under the message (ChatGPT feel)
     const controls = document.createElement('div');
     controls.className = 'row';
     controls.style.marginTop = '10px';
@@ -1143,46 +1049,79 @@ def chat_ui():
     chatView.scrollTop = chatView.scrollHeight;
   }
 
-  document.getElementById('imgEditBtn').onclick = async ()=>{
-    const prompt = (imgPromptEl.value || '').trim();
-    if(!prompt){
-      addMsg('assistant','Type an image edit instruction first (example: "make this pink and black").', []);
+  // UPDATED: Send triggers image edit if an image is attached
+  async function send(){
+    const text = msgEl.value.trim();
+    if(!text) return;
+
+    const snapshot = pending.slice();
+    pending = [];
+    renderPendingTray();
+
+    msgEl.value = '';
+    lastUserMessage = text;
+
+    const imgAtt = lastImageFrom(snapshot);
+    const imgPrompt = (imgPromptEl && imgPromptEl.value ? imgPromptEl.value.trim() : '');
+    const instruction = imgPrompt || text;
+
+    if(imgAtt){
+      addMsg('user', `[Image Edit] ${instruction}`, snapshot);
+
+      if(imgPromptEl) imgPromptEl.value = '';
+
+      let fileToEdit = null;
+      try{
+        const resp = await fetch(imgAtt.preview_url || imgAtt.url);
+        const blob = await resp.blob();
+        const name = imgAtt.name || 'image.png';
+        fileToEdit = new File([blob], name, { type: blob.type || 'image/png' });
+      }catch(e){
+        addMsg('assistant', 'Could not load the attached image for editing. Re-attach the image and try again.', []);
+        return;
+      }
+
+      await runImageEdit(fileToEdit, instruction, imgAtt.name || fileToEdit.name);
+      await loadSessions();
       return;
     }
 
-    const imgAtt = lastPendingImage();
-    if(!imgAtt){
-      addMsg('assistant','Attach an image first using “Attach file”. It will appear in Pending attachments.', []);
-      return;
+    await sendStream(text, snapshot);
+  }
+
+  async function regenerateChat(){
+    if(!lastUserMessage) return;
+    await sendStream(lastUserMessage, []);
+  }
+
+  async function uploadToServer(file){
+    const fd = new FormData();
+    fd.append('file', file);
+
+    const r = await fetch('/api/files/upload', { method:'POST', body: fd });
+    const data = await r.json();
+
+    if(data && data.file && data.file.id){
+      const f = data.file;
+      const isImg = (f.content_type || '').startsWith('image/');
+      const att = {
+        kind: 'server',
+        type: isImg ? 'image' : 'file',
+        name: f.filename,
+        size: f.bytes,
+        file_id: f.id,
+        content_type: f.content_type,
+        preview_url: f.preview_url,
+        url: isImg ? f.preview_url : ''
+      };
+      pending.push(att);
+      renderPendingTray();
+      addMsg('assistant', `Attached "${f.filename}" to pending. Press Send to include it. If it is an image, Send will run an image edit using your message text.`, []);
+    } else {
+      addMsg('assistant', 'Upload failed: ' + JSON.stringify(data), []);
     }
+  }
 
-    // Prefer local file if we have it; but pending uses server upload.
-    // For ChatGPT-like behavior without paid storage, we edit from the local file BEFORE uploading.
-    // Here we only have server item, so we prompt user to re-attach as local OR we fetch and blob it.
-    // We will fetch preview_url and convert to File.
-    let fileToEdit = null;
-
-    try{
-      const resp = await fetch(imgAtt.preview_url || imgAtt.url);
-      const blob = await resp.blob();
-      const name = imgAtt.name || 'image.png';
-      fileToEdit = new File([blob], name, { type: blob.type || 'image/png' });
-    }catch(e){
-      addMsg('assistant', 'Could not load the attached image for editing. Re-attach the image and try again.', []);
-      return;
-    }
-
-    // Show user “tool action” bubble with the image attachment + prompt
-    addMsg('user', `[Image Edit] ${prompt}`, [imgAtt]);
-
-    await runImageEdit(fileToEdit, prompt, imgAtt.name || fileToEdit.name);
-  };
-
-  document.getElementById('regenerateChat').onclick = regenerateChat;
-
-  // ===========================
-  // Wire UI
-  // ===========================
   document.getElementById('send').onclick = send;
   document.getElementById('newChat').onclick = ()=>{
     sessionId = '';
@@ -1196,14 +1135,12 @@ def chat_ui():
   document.getElementById('clear').onclick = ()=>{ chatView.innerHTML = ''; };
   document.getElementById('renameBtn').onclick = renameChat;
   document.getElementById('refreshSessions').onclick = loadSessions;
+  document.getElementById('regenerateChat').onclick = regenerateChat;
 
   document.getElementById('uploadBtn').onclick = ()=> filePicker.click();
   filePicker.addEventListener('change', async (e)=>{
     const f = e.target.files && e.target.files[0];
     if(!f) return;
-
-    // Upload to server so it can be used as chat attachment IDs.
-    // (Also enables image edit by fetching preview_url)
     await uploadToServer(f);
     filePicker.value = '';
   });
@@ -1220,7 +1157,7 @@ def chat_ui():
     }
   });
 
-  addMsg('assistant', 'Ready. Attach files → they appear in your message bubble when you Send. Use Image Edit for ChatGPT-style edits (Regenerate + Modal included).', []);
+  addMsg('assistant', 'Ready. Attach an image → type what to change → Send. It will edit the image automatically (plus Regenerate + View modal).', []);
   renderPendingTray();
   loadSessions();
 </script>
@@ -1499,7 +1436,7 @@ def chat_stream(req: ChatV2Request):
 
 
 # =========================================================
-# Optional: workspace ZIP export endpoints (kept for later)
+# Optional ZIP export (kept)
 # =========================================================
 @app.post("/api/workspace/export_zip")
 def export_workspace_zip(req: ExportWorkspaceZipRequest):
