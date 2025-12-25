@@ -10,24 +10,24 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 # =========================================================
-# CONFIG (Render Environment Variables)
+# CONFIG
 # =========================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("EFECT_DEFAULT_MODEL", "gpt-4.1-mini").strip()
 TOKEN_SECRET = os.getenv("EFECT_TOKEN_SECRET", "change-me").strip()
 
-# If EFECT_REQUIRE_BEARER=1, then every protected endpoint requires:
+# If EFECT_REQUIRE_BEARER=1, protected endpoints require:
 # Authorization: Bearer <EFECT_TOKEN_SECRET>
 REQUIRE_BEARER = os.getenv("EFECT_REQUIRE_BEARER", "0").strip() == "1"
 
-# Persistent storage path (Render Disk mount path recommended: /var/data)
-DATA_DIR = os.getenv("EFECT_DATA_DIR", "/var/data").strip()
+# Storage (Render free tier may be ephemeral)
+DATA_DIR = os.getenv("EFECT_DATA_DIR", ".").strip()
 DATA_PATH = Path(DATA_DIR)
 DATA_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -37,12 +37,13 @@ UPLOAD_DIR = Path(os.getenv("EFECT_UPLOAD_DIR", str(DATA_PATH / "uploads"))).res
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Upload limits
-MAX_UPLOAD_MB = int(os.getenv("EFECT_MAX_UPLOAD_MB", "100"))  # Any file type
+MAX_UPLOAD_MB = int(os.getenv("EFECT_MAX_UPLOAD_MB", "100"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# For injecting attached text files into chat:
-MAX_ATTACH_TEXT_KB = int(os.getenv("EFECT_MAX_ATTACH_TEXT_KB", "200"))  # per file
+# Inject attached text file caps
+MAX_ATTACH_TEXT_KB = int(os.getenv("EFECT_MAX_ATTACH_TEXT_KB", "200"))
 MAX_ATTACH_TEXT_BYTES = MAX_ATTACH_TEXT_KB * 1024
+
 
 # =========================================================
 # APP
@@ -54,6 +55,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================================================
 # DB HELPERS
@@ -75,6 +77,12 @@ def init_db() -> None:
         updated_at INTEGER NOT NULL
     )
     """)
+
+    # Migration: title column
+    try:
+        cur.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS turns (
@@ -145,21 +153,16 @@ def require_token(authorization: Optional[str]) -> None:
 
 
 # =========================================================
-# OPENAI (Responses API)
+# OPENAI (Responses API) - NON-STREAM
 # =========================================================
 def openai_responses(messages: List[Dict[str, str]], model: str) -> str:
     if not OPENAI_API_KEY:
-        return "OPENAI_API_KEY is not set on the server. Add it in Render → Environment."
+        return "OPENAI_API_KEY is not set on the server. Add it in your host environment variables."
 
     url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "input": messages,
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": model, "input": messages}
+
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=90)
     except Exception as e:
@@ -178,24 +181,82 @@ def openai_responses(messages: List[Dict[str, str]], model: str) -> str:
 
 
 # =========================================================
-# PROMPTING
+# OPENAI (Responses API) - STREAM
+# Notes:
+# Streaming events include type="response.output_text.delta" with delta text. :contentReference[oaicite:0]{index=0}
+# =========================================================
+def openai_responses_stream(messages: List[Dict[str, str]], model: str):
+    if not OPENAI_API_KEY:
+        # Stream an error as plain text so UI still works
+        yield "OPENAI_API_KEY is not set on the server.\n"
+        return
+
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": model, "input": messages, "stream": True}
+
+    with requests.post(url, headers=headers, json=payload, stream=True, timeout=120) as r:
+        if r.status_code >= 400:
+            yield f"OpenAI error {r.status_code}: {r.text}"
+            return
+
+        # SSE comes as lines like:
+        # event: response.output_text.delta
+        # data: {...json...}
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+
+            line = raw.strip()
+            if line.startswith("data:"):
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data_str)
+                except Exception:
+                    continue
+
+                # Some servers wrap as {"type": "...", ...}
+                evt_type = evt.get("type") or evt.get("event")
+                if evt_type == "response.output_text.delta":
+                    delta = evt.get("delta") or ""
+                    if delta:
+                        yield delta
+                elif evt_type == "response.completed":
+                    break
+                elif evt_type == "response.error":
+                    err = evt.get("error") or evt
+                    yield f"\n[Error] {err}\n"
+
+
+# =========================================================
+# PROMPTING (wide intelligence + routing)
 # =========================================================
 def default_system_prompt() -> str:
     return (
-        "You are EFECT AI, specialized in UEFN / Verse debugging and building.\n"
-        "Priorities:\n"
-        "1) Correctness over speed\n"
-        "2) Use Verse failure contexts correctly (decides/suspends)\n"
-        "3) Provide minimal, compiling code fixes and clear UEFN device wiring steps\n"
-        "4) If uncertain, ask for the exact error line and the full function/file\n"
-        "Constraints:\n"
-        "- Do not assist with cheating, exploits, or bypassing anti-cheat.\n"
-        "- Focus on legitimate UEFN development.\n"
+        "You are EFECT AI: a wide-scope assistant for (1) Branding/Design, (2) Apps/Websites/EXEs, "
+        "(3) Fortnite Creative/UEFN, and (5) PC Optimization/Troubleshooting, while still handling general questions.\n\n"
+        "Routing:\n"
+        "- First classify the user request into a mode:\n"
+        "  A) Design/Brand (logos, thumbnails, boards, colors, style)\n"
+        "  B) Software Dev (websites, APIs, EXE packaging, bugs)\n"
+        "  C) UEFN/Verse (device wiring, Verse errors, Creative workflows)\n"
+        "  D) PC Optimization (performance, latency, troubleshooting)\n"
+        "  E) General\n"
+        "- Then answer in that mode using correct conventions and step-by-step actions.\n\n"
+        "Working style:\n"
+        "- Prefer actionable steps, minimal working examples, and checklists.\n"
+        "- If debugging, ask only for the minimum missing info (error lines, file, steps to reproduce).\n"
+        "- If the user wants 'same style,' preserve branding and match layout/typography.\n\n"
+        "Safety:\n"
+        "- Do not assist with cheating, exploits, malware, or bypassing protections. Provide legitimate alternatives.\n\n"
+        "Output:\n"
+        "- Be direct and specific. Provide clear next steps and defaults when details are missing."
     )
 
 
 def should_summarize(session_id: str) -> bool:
-    # summarize every 10 user turns
     con = db()
     cur = con.cursor()
     cur.execute("SELECT COUNT(*) AS c FROM turns WHERE session_id=? AND role='user'", (session_id,))
@@ -234,6 +295,7 @@ def tokenize(text: str) -> List[str]:
 def rank_knowledge(query: str, top_k: int) -> List[Dict[str, str]]:
     q = query.lower()
     q_tokens = set(tokenize(q))
+
     con = db()
     cur = con.cursor()
     cur.execute("SELECT id, title, content FROM knowledge")
@@ -269,8 +331,7 @@ def is_text_like(filename: str, content_type: str) -> bool:
         return True
     if content_type.startswith("text/"):
         return True
-    # JSON often comes as application/json
-    if content_type in ("application/json",):
+    if content_type == "application/json":
         return True
     return False
 
@@ -279,7 +340,6 @@ def read_text_file(path: Path, max_bytes: int) -> str:
     data = path.read_bytes()
     if len(data) > max_bytes:
         data = data[:max_bytes]
-    # try utf-8 fallback latin-1
     try:
         return data.decode("utf-8", errors="replace")
     except Exception:
@@ -296,7 +356,7 @@ class ChatV2Request(BaseModel):
     use_memory: bool = True
     use_knowledge: bool = True
     top_k: int = 3
-    file_ids: Optional[List[str]] = None  # Attach saved files
+    file_ids: Optional[List[str]] = None
 
 
 class KnowledgeUpsertRequest(BaseModel):
@@ -315,6 +375,11 @@ class ProfileSetRequest(BaseModel):
     value: str
 
 
+class SessionRenameRequest(BaseModel):
+    session_id: str
+    title: str
+
+
 # =========================================================
 # ROUTES
 # =========================================================
@@ -323,85 +388,193 @@ def root():
     return {"status": "EFECT AI server running"}
 
 
+# ---------------------------
+# ChatGPT-like UI at /chat (STREAMING ENABLED)
+# ---------------------------
 @app.get("/chat", response_class=HTMLResponse)
 def chat_ui():
-    # Clean UI, supports optional file attach by file_id (manual for now)
-    return """
+    return r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>EFECT AI</title>
   <style>
-    body{background:#0b0b0b;color:#e8e8e8;font-family:system-ui,Segoe UI,Arial;margin:0}
-    header{padding:16px 20px;border-bottom:1px solid #1e1e1e;display:flex;align-items:center;gap:12px}
-    .logo{color:#00ff66;font-weight:800;letter-spacing:1px}
-    .wrap{max-width:980px;margin:0 auto;padding:18px}
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    select,input,button,textarea{background:#111;color:#e8e8e8;border:1px solid #2a2a2a;border-radius:10px;padding:10px 12px}
-    button{cursor:pointer}
-    button.primary{background:#00ff66;color:#001b09;border:none;font-weight:700}
-    .chat{margin-top:14px;border:1px solid #222;border-radius:14px;min-height:420px;padding:14px;background:#0f0f0f}
-    .msg{padding:10px 12px;border-radius:12px;margin:10px 0;white-space:pre-wrap;line-height:1.35}
-    .u{background:#141414;border:1px solid #262626}
-    .a{background:#0f1a12;border:1px solid #1d3a2a}
-    .footer{display:flex;gap:10px;margin-top:12px}
-    textarea{flex:1;min-height:54px;max-height:160px;resize:vertical}
-    .pill{font-size:12px;border:1px solid #2a2a2a;border-radius:999px;padding:6px 10px;color:#bdbdbd}
-    .hint{color:#9a9a9a;font-size:12px;margin-top:8px}
+    :root{
+      --bg:#0b0b0b; --panel:#0f0f0f; --panel2:#111;
+      --border:#232323; --text:#e9e9e9; --muted:#a0a0a0;
+      --accent:#00ff66; --accentText:#001b09;
+      --bubbleU:#141414; --bubbleA:#0f1a12;
+      --shadow: 0 8px 30px rgba(0,0,0,.45);
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Arial}
+    .app{display:flex;height:100vh;overflow:hidden}
+    .sidebar{
+      width:300px;min-width:260px;max-width:360px;
+      border-right:1px solid var(--border);
+      background:linear-gradient(180deg,#0c0c0c,#090909);
+      padding:14px;display:flex;flex-direction:column;gap:12px;
+    }
+    .brand{display:flex;align-items:center;justify-content:space-between}
+    .logo{font-weight:900;letter-spacing:1px;color:var(--accent)}
+    .btn{border:1px solid var(--border);background:var(--panel2);color:var(--text);
+      padding:10px 12px;border-radius:12px;cursor:pointer}
+    .btn.primary{background:var(--accent);border:none;color:var(--accentText);font-weight:800}
+    .btn.small{padding:8px 10px;border-radius:10px;font-size:13px}
+    .stack{display:flex;gap:10px;flex-wrap:wrap}
+    .sessions{overflow:auto;flex:1;border:1px solid var(--border);border-radius:14px;background:rgba(15,15,15,.7)}
+    .sess{padding:10px 12px;border-bottom:1px solid #1b1b1b;cursor:pointer}
+    .sess:hover{background:#101010}
+    .sess.active{background:#0f1a12;border-left:3px solid var(--accent)}
+    .sessTitle{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .sessMeta{font-size:12px;color:var(--muted);margin-top:4px}
+    .main{flex:1;display:flex;flex-direction:column}
+    .topbar{
+      padding:14px 16px;border-bottom:1px solid var(--border);
+      display:flex;align-items:center;justify-content:space-between;gap:12px
+    }
+    .pill{font-size:12px;color:var(--muted);border:1px solid var(--border);padding:6px 10px;border-radius:999px}
+    .content{flex:1;overflow:auto;padding:18px;display:flex;justify-content:center}
+    .chatWrap{width:min(980px,100%);display:flex;flex-direction:column;gap:12px}
+    .msg{padding:12px 14px;border-radius:16px;line-height:1.35;white-space:pre-wrap;box-shadow:var(--shadow);border:1px solid var(--border)}
+    .msg.user{background:var(--bubbleU)}
+    .msg.ai{background:var(--bubbleA);border-color:#1d3a2a}
+    .msgHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
+    .name{font-weight:800;font-size:13px}
+    .tools{display:flex;gap:8px}
+    .composer{
+      border-top:1px solid var(--border);
+      padding:14px 16px;display:flex;justify-content:center;background:#0c0c0c
+    }
+    .composerWrap{width:min(980px,100%);display:flex;flex-direction:column;gap:10px}
+    textarea{
+      width:100%;min-height:56px;max-height:180px;resize:vertical;
+      background:var(--panel2);color:var(--text);border:1px solid var(--border);
+      border-radius:16px;padding:12px 12px;font-size:14px;outline:none
+    }
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    select,input[type="text"]{
+      background:var(--panel2);color:var(--text);border:1px solid var(--border);
+      border-radius:12px;padding:10px 12px
+    }
+    input[type="file"]{display:none}
+    .right{margin-left:auto}
+    .typing{font-size:13px;color:var(--muted);padding:6px 2px}
+    @media (max-width: 860px){
+      .sidebar{display:none}
+    }
   </style>
 </head>
 <body>
-<header>
-  <div class="logo">EFECT</div>
-  <div class="pill">UEFN / Verse Debugging</div>
-</header>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">EFECT AI</div>
+      <button class="btn small" id="refreshSessions">↻</button>
+    </div>
 
-<div class="wrap">
-  <div class="row">
-    <label class="pill">Model</label>
-    <select id="model">
-      <option value="gpt-4.1-mini">gpt-4.1-mini</option>
-      <option value="gpt-4.1">gpt-4.1</option>
-    </select>
-    <label class="pill"><input type="checkbox" id="mem" checked> Memory</label>
-    <label class="pill"><input type="checkbox" id="kn" checked> Knowledge</label>
-    <button id="new" class="primary">New Chat</button>
-  </div>
+    <button class="btn primary" id="newChat">New chat</button>
 
-  <div class="hint">
-    File uploads are via API right now: POST /api/files/upload (form-data key "file").
-    Then attach by file_id in chat using the "Attach IDs" box.
-  </div>
+    <div class="stack">
+      <label class="pill"><input type="checkbox" id="mem" checked> Memory</label>
+      <label class="pill"><input type="checkbox" id="kn" checked> Knowledge</label>
+    </div>
 
-  <div class="row" style="margin-top:10px">
-    <input id="attach" style="flex:1" placeholder="Attach IDs (comma-separated), e.g. ab12cd34ef56, 1122aabbccdd">
-  </div>
+    <div class="stack">
+      <select id="model">
+        <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+        <option value="gpt-4.1">gpt-4.1</option>
+      </select>
+    </div>
 
-  <div id="chat" class="chat"></div>
+    <div class="sessions" id="sessions"></div>
 
-  <div class="footer">
-    <textarea id="msg" placeholder="Paste Verse errors + code here..."></textarea>
-    <button id="send" class="primary">Send</button>
-  </div>
+    <div class="stack">
+      <input type="text" id="renameInput" placeholder="Rename current chat..." />
+      <button class="btn small" id="renameBtn">Rename</button>
+    </div>
+
+    <div class="stack">
+      <button class="btn small" id="uploadBtn">Upload file</button>
+      <input id="filePicker" type="file" />
+    </div>
+
+    <div class="pill">
+      Upload any file. Text files can be streamed into context.
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="pill">Streaming • ChatGPT-style</div>
+      <div class="stack right">
+        <button class="btn small" id="regenerate">Regenerate</button>
+        <button class="btn small" id="clear">Clear</button>
+      </div>
+    </div>
+
+    <div class="content">
+      <div class="chatWrap" id="chat"></div>
+    </div>
+
+    <div class="composer">
+      <div class="composerWrap">
+        <div class="row">
+          <span class="pill">Attach file IDs (optional)</span>
+          <input type="text" id="attachIds" placeholder="ab12cd34ef56, 1122aabbccdd" style="flex:1"/>
+        </div>
+        <textarea id="msg" placeholder="Message EFECT AI… (Enter to send, Shift+Enter newline)"></textarea>
+        <div class="row">
+          <div class="typing" id="typing" style="display:none">EFECT AI is thinking…</div>
+          <button class="btn primary right" id="send">Send</button>
+        </div>
+      </div>
+    </div>
+  </main>
 </div>
 
 <script>
   const chatEl = document.getElementById('chat');
+  const sessionsEl = document.getElementById('sessions');
   const msgEl = document.getElementById('msg');
   const modelEl = document.getElementById('model');
   const memEl = document.getElementById('mem');
   const knEl = document.getElementById('kn');
-  const attachEl = document.getElementById('attach');
+  const typingEl = document.getElementById('typing');
+  const attachEl = document.getElementById('attachIds');
+  const renameInput = document.getElementById('renameInput');
+  const filePicker = document.getElementById('filePicker');
 
   let sessionId = localStorage.getItem('efect_session_id') || '';
+  let lastUserMessage = '';
 
-  function add(role, text){
-    const d = document.createElement('div');
-    d.className = 'msg ' + (role === 'user' ? 'u' : 'a');
-    d.textContent = (role === 'user' ? 'You: ' : 'EFECT AI: ') + text;
-    chatEl.appendChild(d);
+  function addMsg(role, text){
+    const wrap = document.createElement('div');
+    wrap.className = 'msg ' + (role==='user' ? 'user' : 'ai');
+
+    const head = document.createElement('div');
+    head.className = 'msgHead';
+    head.innerHTML = `<div class="name">${role==='user' ? 'You' : 'EFECT AI'}</div>`;
+
+    const tools = document.createElement('div');
+    tools.className = 'tools';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn small';
+    copyBtn.textContent = 'Copy';
+    copyBtn.onclick = async ()=>{ try{ await navigator.clipboard.writeText(text); }catch(e){} };
+    tools.appendChild(copyBtn);
+    head.appendChild(tools);
+
+    const body = document.createElement('div');
+    body.textContent = text;
+
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    chatEl.appendChild(wrap);
     chatEl.scrollTop = chatEl.scrollHeight;
+    return body; // return node so we can stream into it
   }
 
   function parseAttach(){
@@ -410,17 +583,35 @@ def chat_ui():
     return raw.split(',').map(x=>x.trim()).filter(Boolean);
   }
 
-  async function send(){
-    const text = msgEl.value.trim();
-    if(!text) return;
-    msgEl.value = '';
-    add('user', text);
+  async function loadSessions(){
+    sessionsEl.innerHTML = '';
+    const r = await fetch('/api/sessions');
+    const data = await r.json();
 
-    const res = await fetch('/api/chat_v2', {
+    data.forEach(s=>{
+      const d = document.createElement('div');
+      d.className = 'sess' + (s.session_id === sessionId ? ' active' : '');
+      const title = (s.title && String(s.title).trim()) ? s.title : ('Chat ' + s.session_id.slice(0,8));
+      const when = s.updated_at ? new Date(s.updated_at*1000).toLocaleString() : '';
+      d.innerHTML = `<div class="sessTitle">${title}</div><div class="sessMeta">${when}</div>`;
+      d.onclick = ()=>{
+        sessionId = s.session_id;
+        localStorage.setItem('efect_session_id', sessionId);
+        loadSessions();
+        addMsg('assistant', 'Switched chat. Continue here.');
+      };
+      sessionsEl.appendChild(d);
+    });
+  }
+
+  async function sendStream(message){
+    typingEl.style.display = 'block';
+
+    const res = await fetch('/api/chat_stream', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        message: text,
+        message,
         session_id: sessionId || null,
         model: modelEl.value,
         use_memory: memEl.checked,
@@ -429,38 +620,142 @@ def chat_ui():
         file_ids: parseAttach()
       })
     });
-    const data = await res.json();
-    sessionId = data.session_id;
-    localStorage.setItem('efect_session_id', sessionId);
-    add('assistant', data.reply || JSON.stringify(data));
+
+    // session id comes back in header for streaming
+    const newSid = res.headers.get('x-efect-session-id');
+    if (newSid) {
+      sessionId = newSid;
+      localStorage.setItem('efect_session_id', sessionId);
+    }
+
+    const aiBodyNode = addMsg('assistant', ''); // stream into this node
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    let full = '';
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      const chunk = decoder.decode(value, {stream:true});
+      full += chunk;
+      aiBodyNode.textContent = full;
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    typingEl.style.display = 'none';
+    await loadSessions();
+    return full;
+  }
+
+  async function send(){
+    const text = msgEl.value.trim();
+    if(!text) return;
+    msgEl.value = '';
+    lastUserMessage = text;
+    addMsg('user', text);
+    await sendStream(text);
+  }
+
+  async function regenerate(){
+    if(!lastUserMessage) return;
+    addMsg('assistant', 'Regenerating…');
+    await sendStream(lastUserMessage);
+  }
+
+  async function renameChat(){
+    const title = renameInput.value.trim();
+    if(!title || !sessionId) return;
+    await fetch('/api/sessions/rename', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId, title })
+    });
+    renameInput.value = '';
+    await loadSessions();
+  }
+
+  async function uploadPickedFile(file){
+    if(!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+
+    const r = await fetch('/api/files/upload', { method:'POST', body: fd });
+    const data = await r.json();
+    if(data && data.file && data.file.id){
+      const current = attachEl.value.trim();
+      attachEl.value = current ? (current + ', ' + data.file.id) : data.file.id;
+      addMsg('assistant', `Uploaded "${data.file.filename}" → file_id: ${data.file.id}. (Added to Attach IDs)`);
+    } else {
+      addMsg('assistant', 'Upload failed: ' + JSON.stringify(data));
+    }
   }
 
   document.getElementById('send').onclick = send;
-  msgEl.addEventListener('keydown', (e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
-  document.getElementById('new').onclick = ()=>{
+  document.getElementById('newChat').onclick = ()=>{
     sessionId = '';
     localStorage.removeItem('efect_session_id');
     chatEl.innerHTML = '';
-    add('assistant', 'New chat started. Paste your Verse compiler error + code.');
+    addMsg('assistant', 'New chat started.');
+    loadSessions();
   };
+  document.getElementById('clear').onclick = ()=>{ chatEl.innerHTML=''; };
+  document.getElementById('regenerate').onclick = regenerate;
+  document.getElementById('renameBtn').onclick = renameChat;
+  document.getElementById('refreshSessions').onclick = loadSessions;
 
-  add('assistant', 'Ready. Paste your Verse error and the full function/file. Upload files via /api/files/upload then attach IDs.');
+  msgEl.addEventListener('keydown', (e)=>{
+    if(e.key==='Enter' && !e.shiftKey){
+      e.preventDefault();
+      send();
+    }
+  });
+
+  document.getElementById('uploadBtn').onclick = ()=> filePicker.click();
+  filePicker.addEventListener('change', async (e)=>{
+    const f = e.target.files && e.target.files[0];
+    await uploadPickedFile(f);
+    filePicker.value = '';
+  });
+
+  addMsg('assistant', 'Ready. Streaming is on.');
+  loadSessions();
 </script>
 </body>
 </html>
 """
 
 
+# ---------------------------
+# Sessions API (ChatGPT-style list)
+# ---------------------------
 @app.get("/api/sessions")
 def list_sessions():
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 200")
+    cur.execute(
+        "SELECT session_id, COALESCE(title,'') AS title, updated_at "
+        "FROM sessions ORDER BY updated_at DESC LIMIT 200"
+    )
     rows = cur.fetchall()
     con.close()
-    return [r["session_id"] for r in rows]
+    return [{"session_id": r["session_id"], "title": r["title"], "updated_at": r["updated_at"]} for r in rows]
 
 
+@app.post("/api/sessions/rename")
+def rename_session(req: SessionRenameRequest, authorization: Optional[str] = Header(default=None)):
+    require_token(authorization)
+    title = req.title.strip()[:60]
+    con = db()
+    cur = con.cursor()
+    cur.execute("UPDATE sessions SET title=? WHERE session_id=?", (title, req.session_id))
+    con.commit()
+    con.close()
+    return {"ok": True}
+
+
+# ---------------------------
+# Profile / Knowledge
+# ---------------------------
 @app.post("/api/profile")
 def set_profile(req: ProfileSetRequest, authorization: Optional[str] = Header(default=None)):
     require_token(authorization)
@@ -500,6 +795,9 @@ def knowledge_search(req: KnowledgeSearchRequest):
     return {"hits": hits}
 
 
+# ---------------------------
+# Files (any type)
+# ---------------------------
 @app.post("/api/files/upload")
 async def upload_file(
     file: UploadFile = File(...),
@@ -595,30 +893,39 @@ def delete_file(file_id: str, authorization: Optional[str] = Header(default=None
     return {"ok": True, "deleted": file_id}
 
 
-@app.post("/api/chat_v2")
-def chat_v2(req: ChatV2Request):
-    sid = req.session_id or str(uuid.uuid4())
-    model = (req.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+# =========================================================
+# CONTEXT BUILDER (shared by non-stream + stream)
+# =========================================================
+def build_messages_for_request(req: ChatV2Request, sid: str, model: str) -> Tuple[List[Dict[str, str]], str]:
+    """
+    Returns (messages_to_model, session_id).
+    Also ensures the user's turn is stored.
+    """
     now = int(time.time())
-
     con = db()
     cur = con.cursor()
 
     # Upsert session
     cur.execute(
-        "INSERT INTO sessions(session_id,created_at,updated_at) VALUES(?,?,?) "
+        "INSERT INTO sessions(session_id,created_at,updated_at,title) VALUES(?,?,?,?) "
         "ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at",
-        (sid, now, now)
+        (sid, now, now, None)
     )
 
-    # Insert user turn
+    # Auto-title on first user message if empty
+    cur.execute("SELECT title FROM sessions WHERE session_id=?", (sid,))
+    trow = cur.fetchone()
+    if trow and (trow["title"] is None or str(trow["title"]).strip() == ""):
+        auto = req.message.strip().split("\n")[0][:40]
+        cur.execute("UPDATE sessions SET title=? WHERE session_id=?", (auto, sid))
+
+    # Save user turn
     cur.execute(
         "INSERT INTO turns(session_id,role,content,created_at) VALUES(?,?,?,?)",
         (sid, "user", req.message, now)
     )
     con.commit()
 
-    # Build memory blocks
     parts: List[Dict[str, str]] = []
 
     if req.use_memory:
@@ -639,7 +946,6 @@ def chat_v2(req: ChatV2Request):
             kb = "\n\n".join([f"[{h['id']}] {h['title']}\n{h['content']}" for h in hits])
             parts.append({"role": "system", "content": "Relevant EFECT Knowledge:\n" + kb})
 
-    # Attach files (only inject text-like files; always store any type)
     if req.file_ids:
         attach_blocks = []
         for fid in req.file_ids[:10]:
@@ -677,9 +983,10 @@ def chat_v2(req: ChatV2Request):
     con.close()
 
     messages = [{"role": "system", "content": default_system_prompt()}] + parts + recent
-    reply = openai_responses(messages, model)
+    return messages, sid
 
-    # Save assistant turn and possibly summary
+
+def save_assistant_turn_and_summary(sid: str, reply: str, model: str) -> None:
     con2 = db()
     cur2 = con2.cursor()
     cur2.execute(
@@ -687,11 +994,9 @@ def chat_v2(req: ChatV2Request):
         (sid, "assistant", reply, int(time.time()))
     )
     cur2.execute("UPDATE sessions SET updated_at=? WHERE session_id=?", (int(time.time()), sid))
-
     con2.commit()
     con2.close()
 
-    # Summarize every 10 user turns
     if should_summarize(sid):
         summ = summarize_session(sid, model)
         con3 = db()
@@ -704,4 +1009,42 @@ def chat_v2(req: ChatV2Request):
         con3.commit()
         con3.close()
 
+
+# ---------------------------
+# Non-stream chat (kept for compatibility)
+# ---------------------------
+@app.post("/api/chat_v2")
+def chat_v2(req: ChatV2Request):
+    sid = req.session_id or str(uuid.uuid4())
+    model = (req.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    messages, sid = build_messages_for_request(req, sid, model)
+    reply = openai_responses(messages, model)
+    save_assistant_turn_and_summary(sid, reply, model)
     return {"session_id": sid, "reply": reply}
+
+
+# ---------------------------
+# STREAMING chat endpoint
+# Returns a streamed text/plain body.
+# Session id is returned in header: x-efect-session-id
+# ---------------------------
+@app.post("/api/chat_stream")
+def chat_stream(req: ChatV2Request):
+    sid = req.session_id or str(uuid.uuid4())
+    model = (req.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+    messages, sid = build_messages_for_request(req, sid, model)
+
+    def gen():
+        full = ""
+        try:
+            for chunk in openai_responses_stream(messages, model):
+                full += chunk
+                yield chunk
+        finally:
+            # Persist the full assistant message after streaming ends
+            if full.strip():
+                save_assistant_turn_and_summary(sid, full, model)
+
+    headers = {"x-efect-session-id": sid}
+    return StreamingResponse(gen(), media_type="text/plain; charset=utf-8", headers=headers)
